@@ -51,7 +51,9 @@ void checkDuckDBArbitrarySQLAllowed(ContextPtr context);
 /// Resolves a database path against `user_files`. An empty path is an in-memory database if `allow_in_memory`, and an empty result.
 String resolveDuckDBDatabasePath(const String & path, ContextPtr context, bool allow_in_memory);
 
-void installDuckDBExtension(const String & name, ContextPtr context);
+/// `name` is an extension name, or a path of an extension file inside `user_files` if `duckdb.allow_extension_files` is set.
+/// `repository` is empty, `core`, `core_nightly` or `community`.
+void installDuckDBExtension(const String & name, const String & repository, ContextPtr context);
 void loadDuckDBExtension(const String & database_path, const String & name, ContextPtr context);
 
 /// The `DuckDB` table engine: a table of an embedded DuckDB database file, read and written through the DuckDB C API.
@@ -71,8 +73,9 @@ void loadDuckDBExtension(const String & database_path, const String & name, Cont
 ///   one `DuckDBInstance` per absolute path. The storage keeps its instance open from the first query until it is destroyed.
 /// - Security. The path is validated against `user_files` (except in `clickhouse-local`), and the database is opened with
 ///   `enable_external_access`, `autoinstall_known_extensions` and `autoload_known_extensions` set to `false`.
-///   The `duckdb` section of the server configuration (`allow_extensions`, `allowed_extensions`, `preload_extensions`,
-///   `extension_directory`) turns on extensions, which need `enable_external_access`; the extension names are validated and allowlisted.
+///   The `duckdb` section of the server configuration turns on extensions (`allow_extensions`, which needs `enable_external_access`),
+///   allowlists them (`allowed_extensions`), and allows native code (`allow_extension_loading`, see `DynamicLoadingScope`), unsigned and
+///   community extensions and extension files. The extension names are validated, and a file is read from `user_files` only.
 /// - Not implemented: pushdown of `WHERE` and `LIMIT`, mutations, `TRUNCATE`, a table function.
 class StorageDuckDB final : public StorageWithCommonVirtualColumns, public WithContext
 {

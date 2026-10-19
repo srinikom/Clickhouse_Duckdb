@@ -35,9 +35,9 @@ SELECT 'load', duckdbLoadExtension('$DB_FILE', 'parquet');
 SELECT 'listed after load', arrayMap(e -> (e.name, e.loaded), arrayFilter(e -> e.name IN ('json', 'parquet'), duckdbExtensions('$DB_FILE')));
 "
 
-# Only the allowed extensions with a plain name are accepted.
+# Only the allowed extensions with a plain name are accepted, and a path is an extension file, which is off.
 $LOCAL --query "SELECT duckdbLoadExtension('$DB_FILE', 'httpfs')" 2>&1 | grep -o "BAD_ARGUMENTS" | head -1
 $LOCAL --query "SELECT duckdbInstallExtension('httpfs')" 2>&1 | grep -o "BAD_ARGUMENTS" | head -1
-$LOCAL --query "SELECT duckdbLoadExtension('$DB_FILE', '../json')" 2>&1 | grep -o "BAD_ARGUMENTS" | head -1
+$LOCAL --query "SELECT duckdbLoadExtension('$DB_FILE', '../json')" 2>&1 | grep -o "SUPPORT_IS_DISABLED" | head -1
 
 rm -rf "$WORK_DIR"

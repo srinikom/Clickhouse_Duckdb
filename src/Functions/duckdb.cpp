@@ -189,17 +189,22 @@ public:
     explicit FunctionDuckDBInstallExtension(ContextPtr context_) : context(context_) {}
 
     String getName() const override { return name; }
-    size_t getNumberOfArguments() const override { return 1; }
+    bool isVariadic() const override { return true; }
+    size_t getNumberOfArguments() const override { return 0; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
+        if (arguments.empty() || arguments.size() > 2)
+            throw Exception(
+                ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH, "Function {} takes 1 or 2 arguments: the extension and the repository", getName());
         checkStringArguments(arguments, getName());
         return std::make_shared<DataTypeUInt8>();
     }
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override
     {
-        installDuckDBExtension(getConstantString(arguments, 0, getName()), context);
+        const String repository = arguments.size() > 1 ? getConstantString(arguments, 1, getName()) : String{};
+        installDuckDBExtension(getConstantString(arguments, 0, getName()), repository, context);
         return result_type->createColumnConst(input_rows_count, 1u);
     }
 
@@ -279,11 +284,14 @@ Requires `duckdb.allow_extensions` in the server configuration and the `WRITE` g
 
     factory.registerFunction<FunctionDuckDBInstallExtension>(FunctionDocumentation{
         .description = R"(
-Installs a DuckDB extension into the extension directory (`duckdb.extension_directory`), which downloads it. The extension has to be in `duckdb.allowed_extensions`.
+Installs a DuckDB extension into the extension directory (`duckdb.extension_directory`), which downloads it from the repository (the official one, `duckdb.custom_extension_repository` or the `repository` argument). The extension has to be in `duckdb.allowed_extensions`.
+The name can also be a path of an extension file inside `user_files`, if `duckdb.allow_extension_files` is set. The repository `community` needs `duckdb.allow_community_extensions`.
 Requires `duckdb.allow_extensions` in the server configuration and the `WRITE` grant on the `FILE` source.
 )",
-        .syntax = "duckdbInstallExtension(name)",
-        .arguments = {{"name", "The name of the extension.", {"const String"}}},
+        .syntax = "duckdbInstallExtension(name[, repository])",
+        .arguments
+        = {{"name", "The name of the extension, or the path of an extension file.", {"const String"}},
+           {"repository", "`core`, `core_nightly` or `community`. Optional.", {"const String"}}},
         .returned_value = {"`1` on success, otherwise an exception is thrown.", {"UInt8"}},
         .examples = {{"Usage", "SELECT duckdbInstallExtension('httpfs')", "1"}},
         .introduced_in = {26, 11},
@@ -291,7 +299,8 @@ Requires `duckdb.allow_extensions` in the server configuration and the `WRITE` g
 
     factory.registerFunction<FunctionDuckDBLoadExtension>(FunctionDocumentation{
         .description = R"(
-Loads an installed DuckDB extension into an opened DuckDB database. The extension has to be in `duckdb.allowed_extensions`, and the database has to exist.
+Loads an installed DuckDB extension, or an extension file of `user_files` (`duckdb.allow_extension_files`), into an opened DuckDB database. The extension has to be in `duckdb.allowed_extensions`, and the database has to exist.
+Loading an extension that is not built into the library needs `duckdb.allow_extension_loading`, because it loads native code. An unsigned extension needs `duckdb.allow_unsigned_extensions` as well.
 The extension stays loaded while the database is open, i.e. while a table of the `DuckDB` engine uses it. Use `duckdb.preload_extensions` to load an extension in every database.
 Requires `duckdb.allow_extensions` in the server configuration and the `WRITE` grant on the `FILE` source.
 )",

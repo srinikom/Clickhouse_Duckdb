@@ -8,6 +8,7 @@
 #include <Common/StringUtils.h>
 #include <Common/getHashOfLoadedBinary.h>
 #include <Common/Crypto/OpenSSLInitializer.h>
+#include <Common/DynamicLoading.h>
 
 
 #include "config.h"
@@ -260,9 +261,34 @@ extern "C"
     void * dlmopen(long, const char *, int); // NOLINT
     int dlclose(void *);
     const char * dlerror();
+    void * dlsym(void *, const char *);
+}
 
-    void * dlopen(const char *, int)
+#if USE_DUCKDB
+/// The extensions of the embedded DuckDB are native libraries. They can be loaded only inside of a `DB::DynamicLoadingScope`,
+/// which is opened if `duckdb.allow_extension_loading` is set in the server configuration. Then the call goes to
+/// the next definition in the lookup order, i.e. the one of libc.
+template <typename F>
+static F nextSymbol(const char * name)
+{
+    return reinterpret_cast<F>(dlsym(reinterpret_cast<void *>(-1l) /* RTLD_NEXT */, name));
+}
+#endif
+
+extern "C"
+{
+    void * dlopen(const char * file, int flags)
     {
+#if USE_DUCKDB
+        if (DB::isDynamicLoadingAllowed())
+        {
+            if (auto next = nextSymbol<void * (*)(const char *, int)>("dlopen"))
+                return next(file, flags);
+        }
+#else
+        (void)file;
+        (void)flags;
+#endif
         return nullptr;
     }
 
@@ -271,13 +297,29 @@ extern "C"
         return nullptr;
     }
 
-    int dlclose(void *)
+    int dlclose(void * handle)
     {
+#if USE_DUCKDB
+        if (DB::isDynamicLoadingAllowed())
+        {
+            if (auto next = nextSymbol<int (*)(void *)>("dlclose"))
+                return next(handle);
+        }
+#else
+        (void)handle;
+#endif
         return 0;
     }
 
     const char * dlerror()
     {
+#if USE_DUCKDB
+        if (DB::isDynamicLoadingAllowed())
+        {
+            if (auto next = nextSymbol<const char * (*)()>("dlerror"))
+                return next();
+        }
+#endif
         return "ClickHouse does not allow dynamic library loading";
     }
 }

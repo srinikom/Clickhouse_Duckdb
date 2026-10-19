@@ -52,27 +52,66 @@ SELECT duckdbVersion();
 
 Everything that reaches outside the DuckDB file is controlled by the `duckdb` section of the server configuration. It is not a query setting on purpose: it is security sensitive, so only the administrator can change it. The values are read when a DuckDB database is opened, so a change applies to the databases opened afterwards. Restart the server, or drop and create the tables again, to apply it to the open ones.
 
+The section can be written in XML or in YAML, in `config.xml` / `config.yaml` or in a file of `config.d`. Both forms mean the same:
+
+<Tabs>
+  <Tab title="XML">
+
 ```xml
 <clickhouse>
     <duckdb>
         <allow_extensions>1</allow_extensions>
-        <allowed_extensions>json, parquet</allowed_extensions>
+        <allowed_extensions>json, parquet, inet</allowed_extensions>
         <preload_extensions>json</preload_extensions>
         <extension_directory>/var/lib/clickhouse/duckdb_extensions/</extension_directory>
+        <allow_extension_loading>1</allow_extension_loading>
+        <allow_unsigned_extensions>0</allow_unsigned_extensions>
+        <allow_community_extensions>0</allow_community_extensions>
+        <allow_extension_files>0</allow_extension_files>
+        <custom_extension_repository></custom_extension_repository>
         <allow_arbitrary_sql>1</allow_arbitrary_sql>
     </duckdb>
 </clickhouse>
 ```
 
+  </Tab>
+  <Tab title="YAML">
+
+```yaml
+duckdb:
+    allow_extensions: 1
+    allowed_extensions: json, parquet, inet
+    preload_extensions: json
+    extension_directory: /var/lib/clickhouse/duckdb_extensions/
+    allow_extension_loading: 1
+    allow_unsigned_extensions: 0
+    allow_community_extensions: 0
+    allow_extension_files: 0
+    custom_extension_repository: ''
+    allow_arbitrary_sql: 1
+```
+
+  </Tab>
+</Tabs>
+
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `allow_extensions` | `0` | Enables the extension functions. DuckDB is then opened with external access, which installing an extension and reading files need. When off, DuckDB is opened without access to the file system and the network, and extensions are never installed or loaded implicitly. |
-| `allowed_extensions` | empty | Comma-separated names of the extensions that can be installed or loaded. Nothing is allowed by default. A name has to consist of letters, digits and `_`, so a path or a URL is rejected. |
-| `preload_extensions` | empty | Names loaded whenever a database is opened. They must be in `allowed_extensions`. |
+| `allow_extensions` | `0` | The main switch. It enables the extension functions, and DuckDB is opened with external access, which installing an extension and reading files need. When off, DuckDB is opened without access to the file system and the network, nothing is installed or loaded implicitly, and all the keys below are ignored. |
+| `allowed_extensions` | empty | Comma-separated names of the extensions that can be installed or loaded. `*` allows any extension. Nothing is allowed by default. A name has to consist of letters, digits and `_`. |
+| `preload_extensions` | empty | Names loaded whenever a database is opened. They must be allowed by `allowed_extensions`. |
 | `extension_directory` | `duckdb_extensions` in the server data directory | Where extensions are installed. |
+| `allow_extension_loading` | `0` | Allows loading the extensions that are not built into `libduckdb.so`. They are native code, and loading one needs `dlopen`, which is forbidden in the `clickhouse` binary. With this key it is allowed only for the time of loading an extension. While a load runs, `dlopen` is open for the whole process, not only for that call, so loads are serialized, and nothing else in the server calls `dlopen`. |
+| `allow_unsigned_extensions` | `0` | Allows extensions that are not signed by DuckDB, such as your own build. |
+| `allow_community_extensions` | `0` | Allows installing from the DuckDB community repository, `duckdbInstallExtension('name', 'community')`. |
+| `allow_extension_files` | `0` | Allows an extension file of `user_files` as the extension in `duckdbInstallExtension` and `duckdbLoadExtension`. |
+| `custom_extension_repository` | empty | The repository that `INSTALL` downloads extensions from, instead of the official one. |
 | `allow_arbitrary_sql` | `0` | Enables the `duckdb` table function. |
 
-You can set a value from the environment with `from_env`, which is useful in containers:
+<Warning>
+`allowed_extensions` = `*` together with `allow_extension_loading` and `allow_unsigned_extensions` lets any user who holds the `WRITE` grant on the `FILE` source run native code of an arbitrary library inside the server process. Allow only what you need, list the extensions by name, and prefer the official signed extensions.
+</Warning>
+
+You can take a value from the environment with `from_env` in XML, which is useful in containers:
 
 ```xml
 <clickhouse>
@@ -82,6 +121,8 @@ You can set a value from the environment with `from_env`, which is useful in con
     </duckdb>
 </clickhouse>
 ```
+
+`from_env` is an XML feature. With YAML, generate the file for the environment instead.
 
 Put the file into `config.d`. The server rejects unknown top-level sections, so the `duckdb` section requires a build that contains the integration.
 
@@ -148,21 +189,34 @@ SELECT arrayJoin(duckdbExtensions()) AS e;
 SELECT arrayJoin(duckdbExtensions('app.duckdb')) AS e;
 
 -- the functions of the loaded extensions
-SELECT arrayJoin(duckdbExtensionFunctions()) AS f WHERE f.name = 'read_parquet';
+SELECT arrayJoin(duckdbExtensionFunctions('app.duckdb')) AS f WHERE f.extension = 'inet';
 
-SELECT duckdbInstallExtension('httpfs');
-SELECT duckdbLoadExtension('app.duckdb', 'json');
+SELECT duckdbInstallExtension('inet');                       -- the official repository
+SELECT duckdbInstallExtension('nanoarrow', 'community');     -- the community repository
+SELECT duckdbInstallExtension('ext/my.duckdb_extension');    -- a file of user_files
+SELECT duckdbLoadExtension('app.duckdb', 'inet');
+SELECT duckdbLoadExtension('app.duckdb', 'ext/my.duckdb_extension');
 ```
 
-`duckdbExtensions` returns `Array(Tuple(name, installed, loaded, version, description))`. `duckdbExtensionFunctions` returns `Array(Tuple(extension, name, type))`, for example `('parquet', 'read_parquet', 'table')`.
+`duckdbExtensions` returns `Array(Tuple(name, installed, loaded, version, description))`. `duckdbExtensionFunctions` returns `Array(Tuple(extension, name, type))`, for example `('inet', 'host', 'scalar')`.
 
-DuckDB does not say which extension a function belongs to. For the built-in `parquet`, `json`, `icu` and `autocomplete` the list is known in advance and filtered to the functions the database actually has. For any other extension, the functions that appear when it is loaded are recorded and reported.
+### How an extension is loaded {#how-an-extension-is-loaded}
 
-### Built-in and external extensions {#built-in-and-external-extensions}
+1. The extension has to be allowed: its name is in `allowed_extensions` (or the list is `*`), or it is a file and `allow_extension_files` is set. A file is read from `user_files` only.
+2. The extensions linked into `libduckdb.so` (`json`, `parquet`, `icu`, `core_functions`, `autocomplete`) are loaded from the start. They need no installation and no `dlopen`.
+3. Any other extension is installed into `extension_directory` (`duckdbInstallExtension`, or copy the file there) and loaded into a database (`duckdbLoadExtension`, or `preload_extensions`). Loading needs `allow_extension_loading`, because it is native code. Without it the call fails with `SUPPORT_IS_DISABLED` before anything is loaded.
+4. An extension that is not signed by DuckDB is rejected by DuckDB unless `allow_unsigned_extensions` is set.
 
-- The extensions linked into `libduckdb.so` (`json`, `parquet`, `icu`, `core_functions`, `autocomplete`) are loaded from the start. They need no installation and no network.
-- Other extensions can be installed with `duckdbInstallExtension`, which downloads them, but they cannot be loaded: the `clickhouse` binary does not allow dynamic library loading, and `LOAD` fails with `ClickHouse does not allow dynamic library loading`.
-- A loaded extension stays loaded while a `DuckDB` table keeps the database open. Use `preload_extensions` to load it in every database.
+A loaded extension stays loaded while a `DuckDB` table keeps the database open. Use `preload_extensions` to load an extension in every database.
+
+### The map of the functions {#the-map-of-the-functions}
+
+DuckDB does not say which extension a function belongs to, so `duckdbExtensionFunctions` registers them in two ways:
+
+- When an extension is loaded, the functions of the database are compared before and after the `LOAD`, and the new ones are recorded for that extension. This covers every extension that is loaded after the start, including your own.
+- The extensions built into the library are loaded before there is anything to compare, so `parquet`, `json`, `icu` and `autocomplete` have a fixed list of function names, filtered to the functions the database actually has.
+
+An extension may add things that are not functions, such as file systems (`httpfs`) or settings, and then its list is empty.
 
 ## Manual testing {#manual-testing}
 
@@ -178,10 +232,14 @@ cat > /tmp/ch/config.d/duckdb.xml <<'XML'
 <clickhouse>
     <duckdb>
         <allow_extensions>1</allow_extensions>
-        <allowed_extensions>json,parquet,httpfs</allowed_extensions>
+        <allowed_extensions>*</allowed_extensions>
         <preload_extensions>json,parquet</preload_extensions>
         <extension_directory>/tmp/ch/duckdb_extensions/</extension_directory>
         <allow_arbitrary_sql>1</allow_arbitrary_sql>
+        <allow_extension_loading>1</allow_extension_loading>
+        <allow_extension_files>1</allow_extension_files>
+        <allow_community_extensions>1</allow_community_extensions>
+        <allow_unsigned_extensions>1</allow_unsigned_extensions>
     </duckdb>
 </clickhouse>
 XML
@@ -191,7 +249,22 @@ LD_LIBRARY_PATH=/path/to/libduckdb ./clickhouse server -- \
     --path=/tmp/ch/data/ --user_files_path=/tmp/ch/user_files/ --tmp_path=/tmp/ch/tmp/
 ```
 
-The server reads `config.xml` and `config.d` from the current directory. The `--path` directory has to exist and end with a slash. In a Docker container, run the same commands inside it and set `LD_LIBRARY_PATH` in the container environment.
+The same settings in YAML, `/tmp/ch/config.d/duckdb.yaml` instead of the XML file:
+
+```yaml
+duckdb:
+    allow_extensions: 1
+    allowed_extensions: "*"
+    preload_extensions: json,parquet
+    extension_directory: /tmp/ch/duckdb_extensions/
+    allow_arbitrary_sql: 1
+    allow_extension_loading: 1
+    allow_extension_files: 1
+    allow_community_extensions: 1
+    allow_unsigned_extensions: 1
+```
+
+Quote the `*` in YAML. The server reads `config.xml` and `config.d` from the current directory. The `--path` directory has to exist and end with a slash. In a Docker container, run the same commands inside it and set `LD_LIBRARY_PATH` in the container environment.
 
 ### 2. Check the build and the settings {#check-the-build-and-the-settings}
 
@@ -277,17 +350,70 @@ Expected:
 ('parquet','read_parquet','table')
 ```
 
-### 6. Install and load {#test-install-and-load}
+### 6. Install and load an external extension {#test-install-and-load}
 
-`duckdbInstallExtension` downloads the extension, so the server needs network access:
+Use a configuration with `allowed_extensions` = `*`, `allow_extension_loading`, `allow_extension_files`, `allow_community_extensions` and `allow_unsigned_extensions` set to `1`. `duckdbInstallExtension` downloads the extension, so the server needs network access. `inet` is not built into the library, so loading it goes through the dynamic loader:
 
 ```sql
-SELECT duckdbInstallExtension('httpfs');                              -- 1
-SELECT arrayFilter(e -> e.name = 'httpfs', duckdbExtensions());       -- installed = 1, loaded = 0
-SELECT duckdbLoadExtension('app.duckdb', 'httpfs');                   -- fails: dynamic library loading is not allowed
-SELECT duckdbInstallExtension('spatial');                             -- BAD_ARGUMENTS: not in allowed_extensions
-SELECT duckdbInstallExtension('../x');                                -- BAD_ARGUMENTS: not a plain name
-SELECT duckdbLoadExtension('app.duckdb', 'json');                     -- 1, already loaded
+SELECT count() FROM t;                                                -- a table keeps the database open
+SELECT duckdbInstallExtension('inet');                                -- 1
+SELECT arrayFilter(e -> e.name = 'inet', duckdbExtensions('app.duckdb'));   -- installed = 1, loaded = 0
+SELECT duckdbLoadExtension('app.duckdb', 'inet');                     -- 1
+SELECT arrayFilter(e -> e.name = 'inet', duckdbExtensions('app.duckdb'));   -- loaded = 1
+SELECT arrayJoin(duckdbExtensionFunctions('app.duckdb')) AS f
+WHERE f.extension = 'inet' ORDER BY f.name LIMIT 3;
+-- ('inet','<<=','scalar')  ('inet','>>=','scalar')  ('inet','broadcast','scalar')
+SELECT * FROM duckdb('app.duckdb', 'SELECT host(''192.168.1.5/24''::INET)::VARCHAR AS h, family(''::1''::INET) AS fam');
+-- 192.168.1.5   6
+```
+
+The community repository and the repository check:
+
+```sql
+SELECT duckdbInstallExtension('nanoarrow', 'community');   -- 1 with allow_community_extensions, otherwise SUPPORT_IS_DISABLED
+SELECT duckdbInstallExtension('x', 'evil');                -- BAD_ARGUMENTS: unknown repository
+SELECT duckdbInstallExtension('no_such_extension_xyz');    -- DUCKDB_ENGINE_ERROR: HTTP 404
+```
+
+Load an extension from a file of `user_files`. Copy the installed `inet` file there and load it into a database where it is not loaded yet:
+
+```bash
+mkdir -p /tmp/ch/user_files/ext
+cp /tmp/ch/duckdb_extensions/v*/linux_amd64/inet.duckdb_extension /tmp/ch/user_files/ext/
+```
+
+```sql
+CREATE TABLE f (x Int32) ENGINE = DuckDB('fresh.duckdb', 'f');
+SELECT duckdbLoadExtension('fresh.duckdb', 'ext/inet.duckdb_extension');   -- 1
+SELECT arrayFilter(e -> e.name = 'inet', duckdbExtensions('fresh.duckdb')).loaded;   -- [1]
+
+SELECT duckdbLoadExtension('fresh.duckdb', '../../etc/passwd.duckdb_extension');   -- PATH_ACCESS_DENIED
+SELECT duckdbLoadExtension('fresh.duckdb', 'ext/missing.duckdb_extension');        -- BAD_ARGUMENTS
+```
+
+An unsigned extension: make a copy of the file with the signature, the last 256 bytes, zeroed. Keep the file name, because DuckDB finds the entry point of the extension by it:
+
+```bash
+mkdir -p /tmp/ch/user_files/unsigned
+python3 - <<'PY'
+d = bytearray(open('/tmp/ch/user_files/ext/inet.duckdb_extension', 'rb').read())
+d[-256:] = bytes(256)
+open('/tmp/ch/user_files/unsigned/inet.duckdb_extension', 'wb').write(d)
+PY
+```
+
+```sql
+CREATE TABLE u (x Int32) ENGINE = DuckDB('unsigned.duckdb', 'u');
+SELECT duckdbLoadExtension('unsigned.duckdb', 'unsigned/inet.duckdb_extension');
+-- allow_unsigned_extensions = 0: DUCKDB_ENGINE_ERROR, "its signature is either missing or invalid and unsigned extensions are disabled"
+-- allow_unsigned_extensions = 1: 1
+```
+
+Set `allow_extension_loading` to `0`, restart, create a table over a fresh database and load `inet` again:
+
+```sql
+SELECT duckdbLoadExtension('fresh2.duckdb', 'inet');   -- SUPPORT_IS_DISABLED: set 'duckdb.allow_extension_loading'
+SELECT duckdbLoadExtension('fresh2.duckdb', 'json');   -- 1: a built-in extension needs no dlopen
 ```
 
 ### 7. The switches {#test-the-switches}
@@ -327,6 +453,20 @@ LD_LIBRARY_PATH=/path/to/libduckdb ./clickhouse local --config-file /tmp/duckdb-
     --query "SELECT * FROM duckdb('', 'SELECT 42 AS answer')"
 ```
 
+The same with a YAML file:
+
+```bash
+cat > /tmp/duckdb-local.yaml <<'YAML'
+duckdb:
+    allow_extensions: 1
+    allowed_extensions: json, parquet
+    allow_arbitrary_sql: 1
+YAML
+
+LD_LIBRARY_PATH=/path/to/libduckdb ./clickhouse local --config-file /tmp/duckdb-local.yaml \
+    --query "SELECT * FROM duckdb('', 'SELECT 42 AS answer')"
+```
+
 ### 10. The automated tests {#the-automated-tests}
 
 From a build with `ENABLE_DUCKDB`, with `LD_LIBRARY_PATH` set and a running server:
@@ -334,10 +474,10 @@ From a build with `ENABLE_DUCKDB`, with `LD_LIBRARY_PATH` set and a running serv
 ```bash
 python3 tests/clickhouse-test --binary ./clickhouse --queries tests/queries --no-stateful --no-shard \
     05406_storage_duckdb 05407_storage_duckdb_transactions 05408_duckdb_functions \
-    05409_duckdb_extensions 05410_duckdb_table_function
+    05409_duckdb_extensions 05410_duckdb_table_function 05411_duckdb_extension_settings
 ```
 
-`05408_duckdb_functions` expects a server without the `duckdb` section, as extensions are disabled by default. The tests `05409` and `05410` use `clickhouse-local` with their own configurations.
+`05408_duckdb_functions` expects a server without the `duckdb` section, as extensions are disabled by default. The tests `05409`, `05410` and `05411` use `clickhouse-local` with their own configurations, `05411` in YAML. They need no network, so installing and loading a real external extension is a manual test (step 6).
 
 ## Troubleshooting {#troubleshooting}
 
@@ -348,7 +488,10 @@ python3 tests/clickhouse-test --binary ./clickhouse --queries tests/queries --no
 | `Unknown table function read_parquet` | `read_parquet` is a DuckDB function: call it inside `duckdb('', '...')`. |
 | `Unknown format Parquet` | This ClickHouse build has no Parquet format. It is unrelated to DuckDB. |
 | `SUPPORT_IS_DISABLED` | `allow_extensions` or `allow_arbitrary_sql` is not set, or the server was not restarted. |
-| `ClickHouse does not allow dynamic library loading` | An extension that is not built into `libduckdb.so` cannot be loaded. |
+| `SUPPORT_IS_DISABLED` ... `duckdb.allow_extension_loading` | The extension is not built into `libduckdb.so`, and loading native code is not allowed: set `allow_extension_loading`. |
+| `signature is either missing or invalid and unsigned extensions are disabled` | The extension is not signed by DuckDB: set `allow_unsigned_extensions` if you trust it. |
+| `Failed to download extension ... (HTTP 404)` | The extension does not exist for this DuckDB version and platform in the repository. |
+| `ClickHouse does not allow dynamic library loading` | A library other than a DuckDB extension, or a build that is older than `allow_extension_loading`, called `dlopen`. |
 | `Cannot access directory ... file system operations are disabled` | The database was opened with `allow_extensions` off, which disables the file system for DuckDB. |
 | `Could not set lock on file` | Another process, such as the `duckdb` command line, holds the database file. |
 
@@ -357,5 +500,6 @@ python3 tests/clickhouse-test --binary ./clickhouse --queries tests/queries --no
 - Linux only, and `libduckdb.so` is a run-time dependency.
 - `WHERE`, `LIMIT` and aggregations are not pushed down into DuckDB for the `DuckDB` engine: the requested columns are read and filtered in ClickHouse. Use the `duckdb` table function to run the filter in DuckDB.
 - No `ALTER ... UPDATE`, `ALTER ... DELETE` or `TRUNCATE`. `DROP TABLE` drops the ClickHouse table, not the DuckDB one.
-- Extensions that are not built into `libduckdb.so` cannot be loaded.
-- The map of extension functions of the built-in extensions is a fixed list.
+- A loaded extension is native code of the server process. It is not sandboxed, and cannot be unloaded until the database is closed.
+- A DuckDB extension must be built for the same DuckDB version and platform as `libduckdb.so`.
+- The map of the functions of the built-in extensions is a fixed list. For the other extensions it is recorded when they are loaded, so it is empty for a database where the extension has not been loaded by the server.

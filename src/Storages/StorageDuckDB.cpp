@@ -24,6 +24,7 @@
 #include <QueryPipeline/Pipe.h>
 #include <Storages/StorageFactory.h>
 #include <Storages/checkAndGetLiteralArgument.h>
+#include <Common/DynamicLoading.h>
 #include <Common/Exception.h>
 #include <Common/StringUtils.h>
 #include <Common/filesystemHelpers.h>
@@ -35,6 +36,7 @@
 #include <array>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <set>
 #include <tuple>
 #include <unordered_map>
@@ -113,7 +115,7 @@ String validateDatabasePath(const String & path, ContextPtr context)
 
     const String absolute_user_files_path = fs::absolute(user_files_path).lexically_normal();
     if (need_check && !fileOrSymlinkPathStartsWith(absolute_path, absolute_user_files_path))
-        throw Exception(ErrorCodes::PATH_ACCESS_DENIED, "DuckDB database file path '{}' must be inside 'user_files' directory", path);
+        throw Exception(ErrorCodes::PATH_ACCESS_DENIED, "DuckDB file path '{}' must be inside 'user_files' directory", path);
 
     return absolute_path;
 }
@@ -124,9 +126,17 @@ String validateDatabasePath(const String & path, ContextPtr context)
 struct ExtensionSettings
 {
     bool enabled = false;
+    /// Any plain extension name is allowed, `*` in `allowed_extensions`.
+    bool allow_any = false;
     std::set<String> allowed;
     std::vector<String> preload;
     String directory;
+    /// Extensions that are not built into the library are native code: loading one needs `dlopen`, which is forbidden in the `clickhouse` binary.
+    bool allow_loading = false;
+    bool allow_unsigned = false;
+    bool allow_community = false;
+    bool allow_files = false;
+    String custom_repository;
 };
 
 std::vector<String> splitList(const String & list)
@@ -164,6 +174,11 @@ ExtensionSettings readExtensionSettings(ContextPtr context)
 
     for (auto & name : splitList(config.getString("duckdb.allowed_extensions", "")))
     {
+        if (name == "*")
+        {
+            settings.allow_any = true;
+            continue;
+        }
         validateExtensionName(name);
         settings.allowed.insert(std::move(name));
     }
@@ -171,22 +186,66 @@ ExtensionSettings readExtensionSettings(ContextPtr context)
     for (auto & name : splitList(config.getString("duckdb.preload_extensions", "")))
     {
         validateExtensionName(name);
-        if (!settings.allowed.contains(name))
+        if (!settings.allow_any && !settings.allowed.contains(name))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "DuckDB extension '{}' is in 'duckdb.preload_extensions' but not in 'duckdb.allowed_extensions'", name);
         settings.preload.push_back(std::move(name));
     }
 
     settings.directory = config.getString("duckdb.extension_directory", fs::path(context->getPath()) / "duckdb_extensions" / "");
+    settings.allow_loading = config.getBool("duckdb.allow_extension_loading", false);
+    settings.allow_unsigned = config.getBool("duckdb.allow_unsigned_extensions", false);
+    settings.allow_community = config.getBool("duckdb.allow_community_extensions", false);
+    settings.allow_files = config.getBool("duckdb.allow_extension_files", false);
+    settings.custom_repository = config.getString("duckdb.custom_extension_repository", "");
     return settings;
 }
 
-void checkExtensionAllowed(const ExtensionSettings & settings, const String & name)
+/// An extension is a name of the repository or, if `allow_extension_files` is set, a file of `user_files`.
+struct ExtensionRef
+{
+    String name;
+    String file;
+    bool isFile() const { return !file.empty(); }
+};
+
+String quoteDuckDBLiteral(std::string_view value)
+{
+    String res = "'";
+    for (char c : value)
+    {
+        if (c == '\'')
+            res += '\'';
+        res += c;
+    }
+    res += '\'';
+    return res;
+}
+
+ExtensionRef resolveExtension(const ExtensionSettings & settings, const String & reference, ContextPtr context)
 {
     if (!settings.enabled)
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "DuckDB extensions are disabled, set 'duckdb.allow_extensions' in the server configuration");
+
+    const bool is_file = reference.find('/') != String::npos || reference.ends_with(".duckdb_extension");
+    if (!is_file)
+    {
+        validateExtensionName(reference);
+        if (!settings.allow_any && !settings.allowed.contains(reference))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "DuckDB extension '{}' is not in 'duckdb.allowed_extensions'", reference);
+        return {reference, {}};
+    }
+
+    if (!settings.allow_files)
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "Extension files are disabled, set 'duckdb.allow_extension_files' in the server configuration");
+
+    /// A file is read from `user_files`, like a database file.
+    String file = validateDatabasePath(reference, context);
+    if (!fs::is_regular_file(file))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "DuckDB extension file '{}' does not exist", reference);
+
+    String name = fs::path(file).stem().string();
     validateExtensionName(name);
-    if (!settings.allowed.contains(name))
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "DuckDB extension '{}' is not in 'duckdb.allowed_extensions'", name);
+    return {name, file};
 }
 
 /// An empty path opens a private in-memory database, which is not shared.
@@ -210,11 +269,13 @@ std::shared_ptr<DuckDBInstance> openRawInstance(const String & path, bool create
     /// the file system, or install extensions on its own. Installing an extension needs both, so the external access
     /// is enabled only if the extensions are, and then the extension directory is pinned and nothing is installed or
     /// loaded implicitly.
-    const std::array<std::pair<const char *, String>, 3> options
+    const std::array<std::pair<const char *, String>, 5> options
     {{
         {"enable_external_access", extensions.enabled ? "true" : "false"},
         {"autoinstall_known_extensions", "false"},
         {"autoload_known_extensions", "false"},
+        {"allow_unsigned_extensions", extensions.allow_unsigned ? "true" : "false"},
+        {"allow_community_extensions", extensions.allow_community ? "true" : "false"},
     }};
 
     auto set_option = [&](const char * name, const String & value)
@@ -233,6 +294,8 @@ std::shared_ptr<DuckDBInstance> openRawInstance(const String & path, bool create
     {
         fs::create_directories(extensions.directory);
         set_option("extension_directory", extensions.directory);
+        if (!extensions.custom_repository.empty())
+            set_option("custom_extension_repository", extensions.custom_repository);
     }
 
     auto result = std::make_shared<DuckDBInstance>();
@@ -323,15 +386,38 @@ std::set<std::pair<String, String>> queryFunctions(duckdb_connection connection)
 
 /// DuckDB does not tell which extension a function belongs to, so the functions are registered by comparing
 /// the functions of the database before and after the extension is loaded.
-void loadExtension(const std::shared_ptr<DuckDBInstance> & instance, const String & name)
+void loadExtension(const std::shared_ptr<DuckDBInstance> & instance, const ExtensionRef & extension, const ExtensionSettings & settings)
 {
     Connection connection(instance);
+
+    /// The extensions linked into the library and the ones already loaded need no `dlopen`.
+    bool needs_dynamic_loading = true;
+    if (!extension.isFile())
+    {
+        const auto rows = queryRows(
+            connection.get(),
+            "SELECT install_mode, loaded FROM duckdb_extensions() WHERE extension_name = " + quoteDuckDBLiteral(extension.name));
+        needs_dynamic_loading = rows.empty() || (rows[0][0] != "STATICALLY_LINKED" && rows[0][1] != "true");
+    }
+
+    std::optional<DynamicLoadingScope> scope;
+    if (needs_dynamic_loading)
+    {
+        if (!settings.allow_loading)
+            throw Exception(
+                ErrorCodes::SUPPORT_IS_DISABLED,
+                "The DuckDB extension '{}' is not built into the library, and loading it needs native code: set 'duckdb.allow_extension_loading' in the server configuration",
+                extension.name);
+        scope.emplace();
+    }
+
     const auto before = queryFunctions(connection.get());
-    connection.execute("LOAD " + name);
+    connection.execute(extension.isFile() ? "LOAD " + quoteDuckDBLiteral(extension.file) : "LOAD " + extension.name);
+    scope.reset();
     const auto after = queryFunctions(connection.get());
 
     std::lock_guard lock(instance->extension_functions_mutex);
-    auto & registered = instance->extension_functions[name];
+    auto & registered = instance->extension_functions[extension.name];
     for (const auto & function : after)
         if (!before.contains(function))
             registered.insert(function);
@@ -342,7 +428,7 @@ std::shared_ptr<DuckDBInstance> openInstance(const String & path, bool create_if
     const auto extensions = readExtensionSettings(context);
     auto result = openRawInstance(path, create_if_missing, extensions);
     for (const auto & name : extensions.preload)
-        loadExtension(result, name);
+        loadExtension(result, {name, {}}, extensions);
     return result;
 }
 
@@ -966,22 +1052,40 @@ std::vector<DuckDBExtensionInfo> listDuckDBExtensions(const String & database_pa
     return res;
 }
 
-void installDuckDBExtension(const String & name, ContextPtr context)
+void installDuckDBExtension(const String & name, const String & repository, ContextPtr context)
 {
     const auto extensions = readExtensionSettings(context);
-    checkExtensionAllowed(extensions, name);
+    const auto extension = resolveExtension(extensions, name, context);
+
+    String statement;
+    if (extension.isFile())
+    {
+        statement = "INSTALL " + quoteDuckDBLiteral(extension.file);
+    }
+    else
+    {
+        statement = "INSTALL " + extension.name;
+        if (!repository.empty())
+        {
+            if (repository == "community" && !extensions.allow_community)
+                throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "Community extensions are disabled, set 'duckdb.allow_community_extensions' in the server configuration");
+            if (repository != "community" && repository != "core" && repository != "core_nightly")
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown DuckDB extension repository '{}', expected 'core', 'core_nightly' or 'community'", repository);
+            statement += " FROM " + repository;
+        }
+    }
 
     /// The installation goes to the extension directory shared by all databases, so a private in-memory database is enough.
     Connection connection(openInstance({}, /* create_if_missing */ true, context));
-    connection.execute("INSTALL " + name);
+    connection.execute(statement);
 }
 
 void loadDuckDBExtension(const String & database_path, const String & name, ContextPtr context)
 {
     const auto extensions = readExtensionSettings(context);
-    checkExtensionAllowed(extensions, name);
+    const auto extension = resolveExtension(extensions, name, context);
 
-    loadExtension(openInstance(validateDatabasePath(database_path, context), /* create_if_missing */ false, context), name);
+    loadExtension(openInstance(validateDatabasePath(database_path, context), /* create_if_missing */ false, context), extension, extensions);
 }
 
 StorageDuckDB::StorageDuckDB(
@@ -1220,27 +1324,51 @@ DuckDB is opened with external file access, automatic extension installation and
 
 ## Extensions {#extensions}
 
-Extensions are managed by the `duckdb` section of the server configuration. They are off by default, and the settings apply to the databases opened afterwards.
+Extensions are managed by the `duckdb` section of the server configuration, in XML or in YAML. They are off by default, and the settings apply to the databases opened afterwards.
 
 ```xml
 <duckdb>
     <allow_extensions>1</allow_extensions>
-    <allowed_extensions>json, parquet</allowed_extensions>
+    <allowed_extensions>json, parquet, inet</allowed_extensions>
     <preload_extensions>json</preload_extensions>
     <extension_directory>/var/lib/clickhouse/duckdb_extensions/</extension_directory>
+    <allow_extension_loading>1</allow_extension_loading>
+    <allow_unsigned_extensions>0</allow_unsigned_extensions>
+    <allow_community_extensions>0</allow_community_extensions>
+    <allow_extension_files>0</allow_extension_files>
+    <custom_extension_repository></custom_extension_repository>
     <allow_arbitrary_sql>1</allow_arbitrary_sql>
 </duckdb>
 ```
 
-- `allow_extensions`: enables the extension functions and opens databases with external access, which installing an extension needs. Default `0`.
-- `allowed_extensions`: comma-separated names of the extensions that can be installed or loaded. Nothing is allowed by default.
-- `preload_extensions`: names, a subset of the allowed ones, loaded when a database is opened.
+```yaml
+duckdb:
+    allow_extensions: 1
+    allowed_extensions: json, parquet, inet
+    preload_extensions: json
+    extension_directory: /var/lib/clickhouse/duckdb_extensions/
+    allow_extension_loading: 1
+    allow_unsigned_extensions: 0
+    allow_community_extensions: 0
+    allow_extension_files: 0
+    custom_extension_repository: ''
+    allow_arbitrary_sql: 1
+```
+
+- `allow_extensions`: the main switch. It enables the extension functions and opens databases with external access, which installing an extension needs. Default `0`.
+- `allowed_extensions`: comma-separated names of the extensions that can be installed or loaded, or `*` for any. Nothing is allowed by default.
+- `preload_extensions`: names, allowed ones, loaded when a database is opened.
 - `extension_directory`: where extensions are installed. Default: `duckdb_extensions` in the server data directory.
+- `allow_extension_loading`: allows loading the extensions that are not built into the library. It is native code, so `dlopen` is allowed only while an extension is being loaded. Default `0`.
+- `allow_unsigned_extensions`: allows extensions that are not signed by DuckDB. Default `0`.
+- `allow_community_extensions`: allows `duckdbInstallExtension('name', 'community')`. Default `0`.
+- `allow_extension_files`: allows an extension file of `user_files` as the extension. Default `0`.
+- `custom_extension_repository`: the repository that extensions are downloaded from instead of the official one.
 - `allow_arbitrary_sql`: enables the `duckdb` table function, which runs a DuckDB query as is. Default `0`.
 
-The functions `duckdbVersion`, `duckdbExtensions`, `duckdbExtensionFunctions`, `duckdbInstallExtension` and `duckdbLoadExtension` list, install and load extensions. `duckdbExtensionFunctions` maps the loaded extensions to the functions they provide, e.g. `parquet` to `read_parquet`.
-The functions of an extension are used in the queries of the `duckdb` table function: `SELECT * FROM duckdb('', 'SELECT * FROM read_parquet(''data.parquet'')')`. The query can do everything DuckDB can, so it is off unless `allow_arbitrary_sql` is set, and it needs the `READ` grant on the `FILE` source. They need the `WRITE` grant on the `FILE` source.
-Extensions linked into the DuckDB library (`json`, `parquet`, `icu`, `core_functions`, `autocomplete`) are always loaded. Other extensions can be installed, but not loaded, because ClickHouse does not allow dynamic library loading.
+The functions `duckdbVersion`, `duckdbExtensions`, `duckdbExtensionFunctions`, `duckdbInstallExtension` and `duckdbLoadExtension` list, install and load extensions. They need the `WRITE` grant on the `FILE` source. `duckdbExtensionFunctions` maps the loaded extensions to the functions they provide, e.g. `parquet` to `read_parquet`.
+The functions of an extension are used in the queries of the `duckdb` table function: `SELECT * FROM duckdb('', 'SELECT * FROM read_parquet(''data.parquet'')')`. The query can do everything DuckDB can, so it is off unless `allow_arbitrary_sql` is set, and it needs the `READ` grant on the `FILE` source.
+Extensions linked into the DuckDB library (`json`, `parquet`, `icu`, `core_functions`, `autocomplete`) are always loaded. Any other extension is installed and loaded when `allow_extension_loading` is set.
 
 ## Limitations {#limitations}
 

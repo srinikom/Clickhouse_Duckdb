@@ -3,4 +3,4 @@ load	1
 listed after load	[('json',1),('parquet',1)]
 BAD_ARGUMENTS
 BAD_ARGUMENTS
-BAD_ARGUMENTS
+SUPPORT_IS_DISABLED

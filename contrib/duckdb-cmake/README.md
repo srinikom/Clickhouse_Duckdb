@@ -30,6 +30,6 @@ costs and is the way to go for an upstream-ready change.
 ## Extensions
 
 The `duckdb` section of the server configuration (`allow_extensions`, `allowed_extensions`, `preload_extensions`,
-`extension_directory`, `allow_arbitrary_sql`), the table function `duckdb` and the functions `duckdbVersion`, `duckdbExtensions`, `duckdbExtensionFunctions`, `duckdbInstallExtension`, `duckdbLoadExtension`
-manage DuckDB extensions, see the documentation of the engine. The tests are `05408_duckdb_functions`, `05409_duckdb_extensions` and `05410_duckdb_table_function`.
-Only the extensions linked into `libduckdb.so` can be loaded: the `clickhouse` binary does not allow `dlopen`.
+`extension_directory`, `allow_extension_loading`, `allow_unsigned_extensions`, `allow_community_extensions`, `allow_extension_files`, `custom_extension_repository`, `allow_arbitrary_sql`), the table function `duckdb` and the functions `duckdbVersion`, `duckdbExtensions`, `duckdbExtensionFunctions`, `duckdbInstallExtension`, `duckdbLoadExtension`
+manage DuckDB extensions, see the documentation of the engine. The tests are `05408_duckdb_functions`, `05409_duckdb_extensions`, `05410_duckdb_table_function` and `05411_duckdb_extension_settings`.
+The `clickhouse` binary forbids `dlopen`, except for the time of loading an extension when `duckdb.allow_extension_loading` is set (`src/Common/DynamicLoading.h`, `programs/main.cpp`), so the other extensions can be installed and loaded as well.
