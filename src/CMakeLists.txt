@@ -892,6 +892,10 @@ if (TARGET ch_contrib::amqp_cpp)
     target_link_libraries(dbms PUBLIC ch_contrib::amqp_cpp)
 endif()
 
+if (TARGET ch_contrib::duckdb)
+    target_link_libraries(dbms PUBLIC ch_contrib::duckdb)
+endif()
+
 if (TARGET ch_contrib::sqlite)
     target_link_libraries(dbms PUBLIC ch_contrib::sqlite)
 endif()

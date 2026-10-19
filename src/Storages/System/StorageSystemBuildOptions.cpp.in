@@ -58,6 +58,7 @@ const char * auto_config_build[]
     "USE_LIBURING", "@USE_LIBURING@",
     "USE_SILK", "@USE_SILK@",
     "USE_SQLITE", "@USE_SQLITE@",
+    "USE_DUCKDB", "@USE_DUCKDB@",
     "USE_LIBPQXX", "@USE_LIBPQXX@",
     "USE_AZURE_BLOB_STORAGE", "@USE_AZURE_BLOB_STORAGE@",
     "USE_AWS_S3", "@USE_AWS_S3@",

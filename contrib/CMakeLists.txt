@@ -222,6 +222,7 @@ if (ENABLE_MECAB)
 endif()
 
 add_contrib (sqlite-cmake sqlite-amalgamation)
+add_subdirectory (duckdb-cmake)
 add_contrib (s2geometry-cmake s2geometry)
 add_contrib (c-ares-cmake c-ares)
 

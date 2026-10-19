@@ -1,0 +1,19 @@
+1	alpha	1.5	true	2024-01-02 03:04:05.678901	2024-01-02	00000000-0000-0000-0000-000000000001	12.34
+2	it\'s "quoted"	\N	false	1999-12-31 23:59:59.000001	1999-12-31	00000000-0000-0000-0000-000000000002	-0.5
+it\'s "quoted"	1
+2	3	2024-01-02 03:04:05.678901
+id	Nullable(Int64)					
+name	Nullable(String)					
+score	Nullable(Float64)					
+flag	Nullable(Bool)					
+ts	Nullable(DateTime64(6))					
+d	Nullable(Date32)					
+u	Nullable(UUID)					
+amount	Nullable(Decimal(10, 2))					
+1	alpha	1.5	true	2024-01-02 03:04:05.678901	2024-01-02	00000000-0000-0000-0000-000000000001	12.34
+2	it\'s "quoted"	\N	false	1999-12-31 23:59:59.000001	1999-12-31	00000000-0000-0000-0000-000000000002	-0.5
+3
+1
+2
+3
+0
