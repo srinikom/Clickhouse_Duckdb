@@ -1,0 +1,14 @@
+--- the rows of a running insert are not visible, and are visible after it commits
+while running	0
+after commit	30
+--- a cancelled insert is rolled back
+after kill	30	0
+--- two writers at the same time
+while running	30
+after commit	a	30	435
+after commit	w1	30	30435
+after commit	w2	30	60435
+--- a failing writer does not affect a concurrent writer
+DUCKDB_ENGINE_ERROR
+after both	w3	30
+total	120
