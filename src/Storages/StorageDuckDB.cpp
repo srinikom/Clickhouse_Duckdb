@@ -28,6 +28,7 @@
 #include <Common/filesystemHelpers.h>
 #include <Common/logger_useful.h>
 
+#include <array>
 #include <filesystem>
 #include <unordered_map>
 
@@ -122,10 +123,14 @@ std::shared_ptr<DuckDBInstance> openInstance(const String & path, bool create_if
 
     /// The engine runs only the statements it generates. Still, do not let an embedded database reach the network or
     /// the file system, or install extensions on its own.
-    for (const auto & [name, value] : {
-             std::pair<const char *, const char *>{"enable_external_access", "false"},
-             {"autoinstall_known_extensions", "false"},
-             {"autoload_known_extensions", "false"}})
+    static const std::array<std::pair<const char *, const char *>, 3> options
+    {{
+        {"enable_external_access", "false"},
+        {"autoinstall_known_extensions", "false"},
+        {"autoload_known_extensions", "false"},
+    }};
+
+    for (const auto & [name, value] : options)
     {
         if (duckdb_set_config(config, name, value) != DuckDBSuccess)
         {
