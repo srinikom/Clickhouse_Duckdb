@@ -1,0 +1,361 @@
+---
+description: 'How to build, configure, use and test the embedded DuckDB: the DuckDB table engine, the duckdb table function, the extension functions and the server settings'
+sidebarTitle: 'Embedded DuckDB'
+slug: /operations/duckdb
+title: 'Embedded DuckDB'
+doc_type: 'guide'
+---
+
+ClickHouse can use [DuckDB](https://duckdb.org) as an embedded database for OLTP-style tables: small tables with transactional inserts, stored in a single DuckDB file next to the server. This page describes how to build and configure the integration, how to use it, and how to test it by hand.
+
+<Note>
+The integration is Linux only and is disabled in a default build. It talks to DuckDB through the DuckDB C API and links the prebuilt `libduckdb.so`, so the library is a run-time dependency of the `clickhouse` binary.
+</Note>
+
+## What is included {#what-is-included}
+
+| Part | Purpose |
+| --- | --- |
+| `DuckDB` table engine | A ClickHouse table backed by a table of a DuckDB file. Supports `SELECT` and transactional `INSERT`. |
+| `duckdb` table function | Runs a DuckDB query and returns its result. It makes the functions of DuckDB extensions, such as `read_parquet`, available. Read-only. |
+| `duckdbVersion` | The version of the DuckDB library. |
+| `duckdbExtensions` | Lists the extensions of DuckDB with their state. |
+| `duckdbExtensionFunctions` | Maps the loaded extensions to the functions they provide. |
+| `duckdbInstallExtension`, `duckdbLoadExtension` | Install and load an extension. |
+| `duckdb` section of the server configuration | Turns on and controls extensions and the table function. |
+
+## Build and run {#build-and-run}
+
+1. Download the `libduckdb-linux-*.zip` archive of a [DuckDB release](https://github.com/duckdb/duckdb/releases) and unpack it. It contains `duckdb.h` and `libduckdb.so`.
+2. Configure ClickHouse with `ENABLE_DUCKDB` and point `DUCKDB_ROOT` to the directory:
+
+```bash
+DUCKDB_ROOT=/path/to/unpacked/zip cmake -DENABLE_DUCKDB=1 ..
+ninja clickhouse
+```
+
+3. Make the library visible at run time, next to the binary or through `LD_LIBRARY_PATH`:
+
+```bash
+export LD_LIBRARY_PATH=/path/to/unpacked/zip
+./clickhouse server
+```
+
+Check that the build contains the integration:
+
+```sql
+SELECT value FROM system.build_options WHERE name = 'USE_DUCKDB';
+SELECT duckdbVersion();
+```
+
+## Server configuration {#server-configuration}
+
+Everything that reaches outside the DuckDB file is controlled by the `duckdb` section of the server configuration. It is not a query setting on purpose: it is security sensitive, so only the administrator can change it. The values are read when a DuckDB database is opened, so a change applies to the databases opened afterwards. Restart the server, or drop and create the tables again, to apply it to the open ones.
+
+```xml
+<clickhouse>
+    <duckdb>
+        <allow_extensions>1</allow_extensions>
+        <allowed_extensions>json, parquet</allowed_extensions>
+        <preload_extensions>json</preload_extensions>
+        <extension_directory>/var/lib/clickhouse/duckdb_extensions/</extension_directory>
+        <allow_arbitrary_sql>1</allow_arbitrary_sql>
+    </duckdb>
+</clickhouse>
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `allow_extensions` | `0` | Enables the extension functions. DuckDB is then opened with external access, which installing an extension and reading files need. When off, DuckDB is opened without access to the file system and the network, and extensions are never installed or loaded implicitly. |
+| `allowed_extensions` | empty | Comma-separated names of the extensions that can be installed or loaded. Nothing is allowed by default. A name has to consist of letters, digits and `_`, so a path or a URL is rejected. |
+| `preload_extensions` | empty | Names loaded whenever a database is opened. They must be in `allowed_extensions`. |
+| `extension_directory` | `duckdb_extensions` in the server data directory | Where extensions are installed. |
+| `allow_arbitrary_sql` | `0` | Enables the `duckdb` table function. |
+
+You can set a value from the environment with `from_env`, which is useful in containers:
+
+```xml
+<clickhouse>
+    <duckdb>
+        <allow_extensions from_env="DUCKDB_ALLOW_EXTENSIONS"/>
+        <allowed_extensions>json, parquet</allowed_extensions>
+    </duckdb>
+</clickhouse>
+```
+
+Put the file into `config.d`. The server rejects unknown top-level sections, so the `duckdb` section requires a build that contains the integration.
+
+## The `DuckDB` table engine {#duckdb-table-engine}
+
+```sql
+CREATE TABLE t (id Int32, name String, created DateTime)
+ENGINE = DuckDB('app.duckdb', 't');
+```
+
+The first argument is a path inside `user_files`, the second is the name of the table in DuckDB.
+
+- With an explicit column list, `CREATE` creates the DuckDB table (and the file) if it does not exist. The columns that are not `Nullable` become `NOT NULL`.
+- Without a column list, the structure is inferred from an existing DuckDB table. Every inferred column is `Nullable`.
+- `ATTACH`, for example when the server starts, never writes to the database.
+- A DuckDB file can be opened by one process only, so the `duckdb` command line cannot use the file while the server holds it.
+
+### Transactions {#transactions}
+
+Every `INSERT` runs in one DuckDB transaction:
+
+- its rows are invisible to other queries until it commits;
+- if it fails or is cancelled (`KILL QUERY`), everything it wrote is rolled back;
+- two inserts into the same table can run at the same time, and each commits independently. A failing insert does not affect the other.
+
+There are no multi-statement transactions controlled by the user.
+
+## The `duckdb` table function {#duckdb-table-function}
+
+```sql
+duckdb('database_path', 'query')
+```
+
+It runs a DuckDB `SELECT` and returns its result, so the functions of the extensions can be used:
+
+```sql
+SELECT * FROM duckdb('', 'SELECT * FROM read_parquet(''/var/lib/clickhouse/user_files/data.parquet'')');
+SELECT * FROM duckdb('app.duckdb', 'SELECT id, count(*) AS n FROM t GROUP BY id');
+```
+
+- `database_path` is a file inside `user_files`, or an empty string for a private in-memory database.
+- The query is passed to DuckDB as is. Quote a single quote inside it by doubling it. It must be a single statement without a semicolon at the end.
+- The result is read-only and its columns are `Nullable`. A DuckDB type that ClickHouse cannot represent, such as `MAP`, is rejected with `NOT_IMPLEMENTED`; select the columns you need instead of `*`.
+- It needs `duckdb.allow_arbitrary_sql` and the `READ` grant on the `FILE` source.
+
+<Warning>
+The query can do everything DuckDB can do with external access, including reading any file the server can read. Enable `allow_arbitrary_sql` only if the users who hold the `READ` grant on the `FILE` source are trusted.
+</Warning>
+
+The structure of the result is found by preparing the query, which does not run it, and DuckDB refuses to prepare several statements. A query that tries to append a second statement fails with `DUCKDB_ENGINE_ERROR` before anything is executed.
+
+## Extensions {#extensions}
+
+### Functions {#functions}
+
+All of them, except `duckdbVersion`, need `duckdb.allow_extensions` and the `WRITE` grant on the `FILE` source. Without the setting they fail with `SUPPORT_IS_DISABLED`.
+
+```sql
+SELECT duckdbVersion();
+
+-- all extensions known to DuckDB, installed and loaded state
+SELECT arrayJoin(duckdbExtensions()) AS e;
+-- the same for a database file
+SELECT arrayJoin(duckdbExtensions('app.duckdb')) AS e;
+
+-- the functions of the loaded extensions
+SELECT arrayJoin(duckdbExtensionFunctions()) AS f WHERE f.name = 'read_parquet';
+
+SELECT duckdbInstallExtension('httpfs');
+SELECT duckdbLoadExtension('app.duckdb', 'json');
+```
+
+`duckdbExtensions` returns `Array(Tuple(name, installed, loaded, version, description))`. `duckdbExtensionFunctions` returns `Array(Tuple(extension, name, type))`, for example `('parquet', 'read_parquet', 'table')`.
+
+DuckDB does not say which extension a function belongs to. For the built-in `parquet`, `json`, `icu` and `autocomplete` the list is known in advance and filtered to the functions the database actually has. For any other extension, the functions that appear when it is loaded are recorded and reported.
+
+### Built-in and external extensions {#built-in-and-external-extensions}
+
+- The extensions linked into `libduckdb.so` (`json`, `parquet`, `icu`, `core_functions`, `autocomplete`) are loaded from the start. They need no installation and no network.
+- Other extensions can be installed with `duckdbInstallExtension`, which downloads them, but they cannot be loaded: the `clickhouse` binary does not allow dynamic library loading, and `LOAD` fails with `ClickHouse does not allow dynamic library loading`.
+- A loaded extension stays loaded while a `DuckDB` table keeps the database open. Use `preload_extensions` to load it in every database.
+
+## Manual testing {#manual-testing}
+
+The commands below start from a built `clickhouse` binary and `libduckdb.so`. Replace the paths. All the SQL can be run in `clickhouse client`.
+
+### 1. Start a server {#start-a-server}
+
+```bash
+mkdir -p /tmp/ch/{data,user_files,tmp,config.d}
+cp programs/server/config.xml programs/server/users.xml /tmp/ch/
+
+cat > /tmp/ch/config.d/duckdb.xml <<'XML'
+<clickhouse>
+    <duckdb>
+        <allow_extensions>1</allow_extensions>
+        <allowed_extensions>json,parquet,httpfs</allowed_extensions>
+        <preload_extensions>json,parquet</preload_extensions>
+        <extension_directory>/tmp/ch/duckdb_extensions/</extension_directory>
+        <allow_arbitrary_sql>1</allow_arbitrary_sql>
+    </duckdb>
+</clickhouse>
+XML
+
+cd /tmp/ch
+LD_LIBRARY_PATH=/path/to/libduckdb ./clickhouse server -- \
+    --path=/tmp/ch/data/ --user_files_path=/tmp/ch/user_files/ --tmp_path=/tmp/ch/tmp/
+```
+
+The server reads `config.xml` and `config.d` from the current directory. The `--path` directory has to exist and end with a slash. In a Docker container, run the same commands inside it and set `LD_LIBRARY_PATH` in the container environment.
+
+### 2. Check the build and the settings {#check-the-build-and-the-settings}
+
+```sql
+SELECT duckdbVersion();
+SELECT arrayJoin(duckdbExtensions()) AS e WHERE e.loaded;
+```
+
+Expected: the version, for example `v1.5.6`, and the built-in extensions `autocomplete`, `core_functions`, `icu`, `json`, `parquet` as loaded. With `allow_extensions` off the second query fails with `SUPPORT_IS_DISABLED`.
+
+### 3. The table engine and transactions {#test-the-table-engine}
+
+```sql
+CREATE TABLE t (id Int32, name String) ENGINE = DuckDB('app.duckdb', 't');
+INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');
+SELECT * FROM t ORDER BY id;
+
+-- the structure is inferred from the existing table
+CREATE TABLE t2 ENGINE = DuckDB('app.duckdb', 't');
+SHOW CREATE TABLE t2;
+
+-- a path outside user_files is rejected
+CREATE TABLE bad (x Int32) ENGINE = DuckDB('/etc/x.duckdb', 'x');  -- PATH_ACCESS_DENIED
+```
+
+To see that an insert is invisible until it commits, run a slow insert in one `clickhouse client` session and count the rows in another:
+
+```sql
+-- session 1: 30 rows, 50 ms per row
+INSERT INTO t SELECT number + 100, 'slow' FROM numbers(30) WHERE sleepEachRow(0.05) = 0
+SETTINGS max_block_size = 1, max_threads = 1;
+
+-- session 2, while it runs
+SELECT count() FROM t WHERE name = 'slow';   -- 0
+-- after it finishes
+SELECT count() FROM t WHERE name = 'slow';   -- 30
+```
+
+Run the insert again, and while it runs find and cancel it in session 2:
+
+```sql
+SELECT query_id FROM system.processes WHERE query LIKE 'INSERT INTO t%';
+KILL QUERY WHERE query_id = '<query_id>' SYNC;
+SELECT count() FROM t WHERE name = 'slow';   -- unchanged: the insert was rolled back
+```
+
+Two writers: start the slow insert in two sessions with different ids at the same time. Both commit, and the table gets the rows of both.
+
+### 4. The table function and the Parquet extension {#test-the-parquet-extension}
+
+ClickHouse can be built without the Parquet format, so create a Parquet file with DuckDB itself, for example with the Python package (`python3 -m pip install duckdb`):
+
+```bash
+python3 -c "import duckdb; duckdb.sql(\"COPY (SELECT range AS id, CAST(range AS VARCHAR) AS name, range * 1.5 AS score FROM range(5)) TO '/tmp/ch/user_files/data.parquet' (FORMAT parquet)\")"
+```
+
+```sql
+SELECT * FROM duckdb('', 'SELECT * FROM read_parquet(''/tmp/ch/user_files/data.parquet'')') ORDER BY id;
+SELECT sum(score) FROM duckdb('', 'SELECT * FROM read_parquet(''/tmp/ch/user_files/data.parquet'')');   -- 15
+SELECT * FROM duckdb('', 'SELECT 42 AS answer');
+SELECT * FROM duckdb('app.duckdb', 'SELECT id, upper(name) AS n FROM t WHERE id > 1');
+```
+
+The functions of an extension are only known to DuckDB, so calling one directly in ClickHouse fails:
+
+```sql
+SELECT * FROM read_parquet('/tmp/ch/user_files/data.parquet');   -- UNKNOWN_FUNCTION
+```
+
+### 5. The extension map {#test-the-extension-map}
+
+```sql
+SELECT arrayJoin(duckdbExtensionFunctions()) AS f
+WHERE f.name IN ('read_parquet', 'read_json', 'json_extract')
+ORDER BY f.name;
+```
+
+Expected:
+
+```text
+('json','json_extract','scalar')
+('json','read_json','table')
+('parquet','read_parquet','table')
+```
+
+### 6. Install and load {#test-install-and-load}
+
+`duckdbInstallExtension` downloads the extension, so the server needs network access:
+
+```sql
+SELECT duckdbInstallExtension('httpfs');                              -- 1
+SELECT arrayFilter(e -> e.name = 'httpfs', duckdbExtensions());       -- installed = 1, loaded = 0
+SELECT duckdbLoadExtension('app.duckdb', 'httpfs');                   -- fails: dynamic library loading is not allowed
+SELECT duckdbInstallExtension('spatial');                             -- BAD_ARGUMENTS: not in allowed_extensions
+SELECT duckdbInstallExtension('../x');                                -- BAD_ARGUMENTS: not a plain name
+SELECT duckdbLoadExtension('app.duckdb', 'json');                     -- 1, already loaded
+```
+
+### 7. The switches {#test-the-switches}
+
+Set `allow_arbitrary_sql` to `0`, restart the server and run:
+
+```sql
+SELECT * FROM duckdb('', 'SELECT 1');   -- SUPPORT_IS_DISABLED
+```
+
+Set `allow_extensions` to `0` and restart. The extension functions fail with `SUPPORT_IS_DISABLED`, and the tables keep working, but a query that reads a file, such as one with `read_parquet`, fails because DuckDB has no file system access.
+
+### 8. A query cannot run a second statement {#test-single-statement}
+
+```sql
+SELECT * FROM duckdb('app.duckdb', 'SELECT 1 AS a) AS q; CREATE TABLE evil(x INT); SELECT * FROM (SELECT 1 AS a');
+-- DUCKDB_ENGINE_ERROR: Cannot prepare multiple statements at once
+SELECT count() FROM duckdb('app.duckdb', 'SELECT table_name FROM duckdb_tables() WHERE table_name = ''evil''');   -- 0
+```
+
+### 9. Without a server {#without-a-server}
+
+`clickhouse-local` does not validate the configuration sections, which makes it useful for a quick check of a configuration:
+
+```bash
+cat > /tmp/duckdb-local.xml <<'XML'
+<clickhouse>
+    <duckdb>
+        <allow_extensions>1</allow_extensions>
+        <allowed_extensions>json,parquet</allowed_extensions>
+        <allow_arbitrary_sql>1</allow_arbitrary_sql>
+    </duckdb>
+</clickhouse>
+XML
+
+LD_LIBRARY_PATH=/path/to/libduckdb ./clickhouse local --config-file /tmp/duckdb-local.xml \
+    --query "SELECT * FROM duckdb('', 'SELECT 42 AS answer')"
+```
+
+### 10. The automated tests {#the-automated-tests}
+
+From a build with `ENABLE_DUCKDB`, with `LD_LIBRARY_PATH` set and a running server:
+
+```bash
+python3 tests/clickhouse-test --binary ./clickhouse --queries tests/queries --no-stateful --no-shard \
+    05406_storage_duckdb 05407_storage_duckdb_transactions 05408_duckdb_functions \
+    05409_duckdb_extensions 05410_duckdb_table_function
+```
+
+`05408_duckdb_functions` expects a server without the `duckdb` section, as extensions are disabled by default. The tests `05409` and `05410` use `clickhouse-local` with their own configurations.
+
+## Troubleshooting {#troubleshooting}
+
+| Symptom | Cause |
+| --- | --- |
+| `error while loading shared libraries: libduckdb.so` | The library is not found: set `LD_LIBRARY_PATH`. |
+| The server exits with `UNKNOWN_ELEMENT_IN_CONFIG` for `duckdb` | The binary was built without `ENABLE_DUCKDB`, or is older than the `duckdb` section. |
+| `Unknown table function read_parquet` | `read_parquet` is a DuckDB function: call it inside `duckdb('', '...')`. |
+| `Unknown format Parquet` | This ClickHouse build has no Parquet format. It is unrelated to DuckDB. |
+| `SUPPORT_IS_DISABLED` | `allow_extensions` or `allow_arbitrary_sql` is not set, or the server was not restarted. |
+| `ClickHouse does not allow dynamic library loading` | An extension that is not built into `libduckdb.so` cannot be loaded. |
+| `Cannot access directory ... file system operations are disabled` | The database was opened with `allow_extensions` off, which disables the file system for DuckDB. |
+| `Could not set lock on file` | Another process, such as the `duckdb` command line, holds the database file. |
+
+## Limitations {#limitations}
+
+- Linux only, and `libduckdb.so` is a run-time dependency.
+- `WHERE`, `LIMIT` and aggregations are not pushed down into DuckDB for the `DuckDB` engine: the requested columns are read and filtered in ClickHouse. Use the `duckdb` table function to run the filter in DuckDB.
+- No `ALTER ... UPDATE`, `ALTER ... DELETE` or `TRUNCATE`. `DROP TABLE` drops the ClickHouse table, not the DuckDB one.
+- Extensions that are not built into `libduckdb.so` cannot be loaded.
+- The map of extension functions of the built-in extensions is a fixed list.
