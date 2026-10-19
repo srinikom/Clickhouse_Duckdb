@@ -2296,6 +2296,7 @@ void ServerSettings::checkUnknownSettings(const Poco::Util::AbstractConfiguratio
 
         /// Storage
         "storage_configuration",
+        "duckdb",
         "backups",
         "compression",
         "encryption_codecs",
