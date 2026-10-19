@@ -26,3 +26,10 @@ It avoids compiling DuckDB (hundreds of translation units) and keeping a fork of
 self-contained, that the library is not built with the ClickHouse toolchain and sanitizers, and that two C++ runtimes
 (`libc++` and `libstdc++`) live in one process. Building DuckDB from source as a regular `contrib` module would remove these
 costs and is the way to go for an upstream-ready change.
+
+## Extensions
+
+The `duckdb` section of the server configuration (`allow_extensions`, `allowed_extensions`, `preload_extensions`,
+`extension_directory`) and the functions `duckdbVersion`, `duckdbExtensions`, `duckdbInstallExtension`, `duckdbLoadExtension`
+manage DuckDB extensions, see the documentation of the engine. The tests are `05408_duckdb_functions` and `05409_duckdb_extensions`.
+Only the extensions linked into `libduckdb.so` can be loaded: the `clickhouse` binary does not allow `dlopen`.

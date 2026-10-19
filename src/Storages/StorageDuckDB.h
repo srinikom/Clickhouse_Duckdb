@@ -7,12 +7,33 @@
 
 #include <memory>
 #include <mutex>
+#include <vector>
 
 namespace DB
 {
 
 /// An opened DuckDB database file. Defined in `StorageDuckDB.cpp` to keep `duckdb.h` out of the headers.
 struct DuckDBInstance;
+
+/// One row of `duckdb_extensions`.
+struct DuckDBExtensionInfo
+{
+    String name;
+    bool installed = false;
+    bool loaded = false;
+    String version;
+    String description;
+};
+
+/// The functions below back the SQL functions `duckdbVersion`, `duckdbExtensions`, `duckdbInstallExtension` and
+/// `duckdbLoadExtension`. Extension management is off unless `duckdb.allow_extensions` is set in the server configuration,
+/// and only the names in `duckdb.allowed_extensions` can be installed or loaded.
+String getDuckDBLibraryVersion();
+
+/// An empty `database_path` lists the extensions of a private in-memory database, i.e. what is installed in the extension directory.
+std::vector<DuckDBExtensionInfo> listDuckDBExtensions(const String & database_path, ContextPtr context);
+void installDuckDBExtension(const String & name, ContextPtr context);
+void loadDuckDBExtension(const String & database_path, const String & name, ContextPtr context);
 
 /// The `DuckDB` table engine: a table of an embedded DuckDB database file, read and written through the DuckDB C API.
 /// `ENGINE = DuckDB('path_to_database_file', 'table')`
@@ -31,6 +52,8 @@ struct DuckDBInstance;
 ///   one `DuckDBInstance` per absolute path. The storage keeps its instance open from the first query until it is destroyed.
 /// - Security. The path is validated against `user_files` (except in `clickhouse-local`), and the database is opened with
 ///   `enable_external_access`, `autoinstall_known_extensions` and `autoload_known_extensions` set to `false`.
+///   The `duckdb` section of the server configuration (`allow_extensions`, `allowed_extensions`, `preload_extensions`,
+///   `extension_directory`) turns on extensions, which need `enable_external_access`; the extension names are validated and allowlisted.
 /// - Not implemented: pushdown of `WHERE` and `LIMIT`, mutations, `TRUNCATE`, a table function.
 class StorageDuckDB final : public StorageWithCommonVirtualColumns, public WithContext
 {

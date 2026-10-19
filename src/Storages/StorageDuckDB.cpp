@@ -25,11 +25,16 @@
 #include <Storages/StorageFactory.h>
 #include <Storages/checkAndGetLiteralArgument.h>
 #include <Common/Exception.h>
+#include <Common/StringUtils.h>
 #include <Common/filesystemHelpers.h>
 #include <Common/logger_useful.h>
 
+#include <Poco/Util/AbstractConfiguration.h>
+
+#include <algorithm>
 #include <array>
 #include <filesystem>
+#include <set>
 #include <unordered_map>
 
 namespace fs = std::filesystem;
@@ -45,6 +50,7 @@ namespace ErrorCodes
     extern const int NOT_IMPLEMENTED;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
     extern const int PATH_ACCESS_DENIED;
+    extern const int SUPPORT_IS_DISABLED;
 }
 
 struct DuckDBInstance
@@ -106,15 +112,88 @@ String validateDatabasePath(const String & path, ContextPtr context)
     return absolute_path;
 }
 
-std::shared_ptr<DuckDBInstance> openInstance(const String & path, bool create_if_missing)
+/// The `duckdb` section of the server configuration. It is read when a database is opened, so a change applies to
+/// the databases opened afterwards. Extensions are off by default: an extension is native code, and installing one
+/// needs the network and the file system.
+struct ExtensionSettings
+{
+    bool enabled = false;
+    std::set<String> allowed;
+    std::vector<String> preload;
+    String directory;
+};
+
+std::vector<String> splitList(const String & list)
+{
+    std::vector<String> result;
+    size_t begin = 0;
+    while (begin <= list.size())
+    {
+        size_t end = list.find(',', begin);
+        if (end == String::npos)
+            end = list.size();
+        String item = list.substr(begin, end - begin);
+        const auto first = item.find_first_not_of(" \t\n");
+        if (first != String::npos)
+            result.push_back(item.substr(first, item.find_last_not_of(" \t\n") - first + 1));
+        begin = end + 1;
+    }
+    return result;
+}
+
+/// An extension name ends up in `INSTALL`/`LOAD` statements: only plain names are accepted, never paths or URLs.
+void validateExtensionName(const String & name)
+{
+    if (name.empty() || !std::all_of(name.begin(), name.end(), [](char c) { return isAlphaNumericASCII(c) || c == '_'; }))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid DuckDB extension name '{}'", name);
+}
+
+ExtensionSettings readExtensionSettings(ContextPtr context)
+{
+    ExtensionSettings settings;
+    const auto & config = context->getConfigRef();
+    settings.enabled = config.getBool("duckdb.allow_extensions", false);
+    if (!settings.enabled)
+        return settings;
+
+    for (auto & name : splitList(config.getString("duckdb.allowed_extensions", "")))
+    {
+        validateExtensionName(name);
+        settings.allowed.insert(std::move(name));
+    }
+
+    for (auto & name : splitList(config.getString("duckdb.preload_extensions", "")))
+    {
+        validateExtensionName(name);
+        if (!settings.allowed.contains(name))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "DuckDB extension '{}' is in 'duckdb.preload_extensions' but not in 'duckdb.allowed_extensions'", name);
+        settings.preload.push_back(std::move(name));
+    }
+
+    settings.directory = config.getString("duckdb.extension_directory", fs::path(context->getPath()) / "duckdb_extensions" / "");
+    return settings;
+}
+
+void checkExtensionAllowed(const ExtensionSettings & settings, const String & name)
+{
+    if (!settings.enabled)
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "DuckDB extensions are disabled, set 'duckdb.allow_extensions' in the server configuration");
+    validateExtensionName(name);
+    if (!settings.allowed.contains(name))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "DuckDB extension '{}' is not in 'duckdb.allowed_extensions'", name);
+}
+
+/// An empty path opens a private in-memory database, which is not shared.
+std::shared_ptr<DuckDBInstance> openRawInstance(const String & path, bool create_if_missing, const ExtensionSettings & extensions)
 {
     std::lock_guard lock(instances_mutex);
 
-    if (auto it = opened_instances.find(path); it != opened_instances.end())
-        if (auto existing = it->second.lock())
-            return existing;
+    if (!path.empty())
+        if (auto it = opened_instances.find(path); it != opened_instances.end())
+            if (auto existing = it->second.lock())
+                return existing;
 
-    if (!create_if_missing && !fs::exists(path))
+    if (!path.empty() && !create_if_missing && !fs::exists(path))
         throw Exception(ErrorCodes::PATH_ACCESS_DENIED, "DuckDB database file '{}' does not exist", path);
 
     duckdb_config config = nullptr;
@@ -122,26 +201,37 @@ std::shared_ptr<DuckDBInstance> openInstance(const String & path, bool create_if
         throw Exception(ErrorCodes::DUCKDB_ENGINE_ERROR, "DuckDB: cannot create the configuration");
 
     /// The engine runs only the statements it generates. Still, do not let an embedded database reach the network or
-    /// the file system, or install extensions on its own.
-    static const std::array<std::pair<const char *, const char *>, 3> options
+    /// the file system, or install extensions on its own. Installing an extension needs both, so the external access
+    /// is enabled only if the extensions are, and then the extension directory is pinned and nothing is installed or
+    /// loaded implicitly.
+    const std::array<std::pair<const char *, String>, 3> options
     {{
-        {"enable_external_access", "false"},
+        {"enable_external_access", extensions.enabled ? "true" : "false"},
         {"autoinstall_known_extensions", "false"},
         {"autoload_known_extensions", "false"},
     }};
 
-    for (const auto & [name, value] : options)
+    auto set_option = [&](const char * name, const String & value)
     {
-        if (duckdb_set_config(config, name, value) != DuckDBSuccess)
+        if (duckdb_set_config(config, name, value.c_str()) != DuckDBSuccess)
         {
             duckdb_destroy_config(&config);
             throw Exception(ErrorCodes::DUCKDB_ENGINE_ERROR, "DuckDB: cannot set the option '{}'", name);
         }
+    };
+
+    for (const auto & [name, value] : options)
+        set_option(name, value);
+
+    if (extensions.enabled)
+    {
+        fs::create_directories(extensions.directory);
+        set_option("extension_directory", extensions.directory);
     }
 
     auto result = std::make_shared<DuckDBInstance>();
     char * error = nullptr;
-    const auto state = duckdb_open_ext(path.c_str(), &result->database, config, &error);
+    const auto state = duckdb_open_ext(path.empty() ? nullptr : path.c_str(), &result->database, config, &error);
     duckdb_destroy_config(&config);
     if (state != DuckDBSuccess)
     {
@@ -150,7 +240,8 @@ std::shared_ptr<DuckDBInstance> openInstance(const String & path, bool create_if
         throw Exception(ErrorCodes::DUCKDB_ENGINE_ERROR, "DuckDB: cannot open the database '{}': {}", path, message);
     }
 
-    opened_instances[path] = result;
+    if (!path.empty())
+        opened_instances[path] = result;
     return result;
 }
 
@@ -188,6 +279,21 @@ private:
     std::shared_ptr<DuckDBInstance> instance;
     duckdb_connection connection = nullptr;
 };
+
+void loadExtension(const std::shared_ptr<DuckDBInstance> & instance, const String & name)
+{
+    Connection connection(instance);
+    connection.execute("LOAD " + name);
+}
+
+std::shared_ptr<DuckDBInstance> openInstance(const String & path, bool create_if_missing, ContextPtr context)
+{
+    const auto extensions = readExtensionSettings(context);
+    auto result = openRawInstance(path, create_if_missing, extensions);
+    for (const auto & name : extensions.preload)
+        loadExtension(result, name);
+    return result;
+}
 
 class PreparedStatement
 {
@@ -705,6 +811,63 @@ private:
 }
 
 
+String getDuckDBLibraryVersion()
+{
+    return duckdb_library_version();
+}
+
+std::vector<DuckDBExtensionInfo> listDuckDBExtensions(const String & database_path, ContextPtr context)
+{
+    const auto extensions = readExtensionSettings(context);
+    if (!extensions.enabled)
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "DuckDB extensions are disabled, set 'duckdb.allow_extensions' in the server configuration");
+
+    const String path = database_path.empty() ? String{} : validateDatabasePath(database_path, context);
+    Connection connection(openInstance(path, /* create_if_missing */ false, context));
+
+    duckdb_result result;
+    const char * query = "SELECT extension_name, installed, loaded, coalesce(extension_version, ''), coalesce(description, '') "
+                         "FROM duckdb_extensions() ORDER BY extension_name";
+    if (duckdb_query(connection.get(), query, &result) != DuckDBSuccess)
+    {
+        String message = duckdb_result_error(&result) ? duckdb_result_error(&result) : "unknown error";
+        duckdb_destroy_result(&result);
+        throw Exception(ErrorCodes::DUCKDB_ENGINE_ERROR, "DuckDB: cannot list the extensions: {}", message);
+    }
+
+    auto text = [&](idx_t column, idx_t row)
+    {
+        char * value = duckdb_value_varchar(&result, column, row);
+        String res = value ? value : "";
+        duckdb_free(value);
+        return res;
+    };
+
+    std::vector<DuckDBExtensionInfo> res;
+    for (idx_t row = 0; row < duckdb_row_count(&result); ++row)
+        res.push_back({text(0, row), duckdb_value_boolean(&result, 1, row), duckdb_value_boolean(&result, 2, row), text(3, row), text(4, row)});
+    duckdb_destroy_result(&result);
+    return res;
+}
+
+void installDuckDBExtension(const String & name, ContextPtr context)
+{
+    const auto extensions = readExtensionSettings(context);
+    checkExtensionAllowed(extensions, name);
+
+    /// The installation goes to the extension directory shared by all databases, so a private in-memory database is enough.
+    Connection connection(openInstance({}, /* create_if_missing */ true, context));
+    connection.execute("INSTALL " + name);
+}
+
+void loadDuckDBExtension(const String & database_path, const String & name, ContextPtr context)
+{
+    const auto extensions = readExtensionSettings(context);
+    checkExtensionAllowed(extensions, name);
+
+    loadExtension(openInstance(validateDatabasePath(database_path, context), /* create_if_missing */ false, context), name);
+}
+
 StorageDuckDB::StorageDuckDB(
     const StorageID & table_id_,
     const String & database_path_,
@@ -757,7 +920,7 @@ std::shared_ptr<DuckDBInstance> StorageDuckDB::getInstance(bool create_if_missin
 {
     std::lock_guard lock(instance_mutex);
     if (!instance)
-        instance = openInstance(database_path, create_if_missing);
+        instance = openInstance(database_path, create_if_missing, getContext());
     return instance;
 }
 
@@ -923,6 +1086,27 @@ Every `INSERT` runs in one DuckDB transaction that is committed when the insert 
 Every query uses its own DuckDB connection, so cancelling a query interrupts only that query.
 Tables over the same file in one server share one DuckDB database instance, which stays open as long as one of them exists. A DuckDB file can be opened by only one process at a time, so it cannot be used by the `duckdb` command line while the server holds it.
 DuckDB is opened with external file access, automatic extension installation and extension autoloading disabled.
+
+## Extensions {#extensions}
+
+Extensions are managed by the `duckdb` section of the server configuration. They are off by default, and the settings apply to the databases opened afterwards.
+
+```xml
+<duckdb>
+    <allow_extensions>1</allow_extensions>
+    <allowed_extensions>json, parquet</allowed_extensions>
+    <preload_extensions>json</preload_extensions>
+    <extension_directory>/var/lib/clickhouse/duckdb_extensions/</extension_directory>
+</duckdb>
+```
+
+- `allow_extensions`: enables the extension functions and opens databases with external access, which installing an extension needs. Default `0`.
+- `allowed_extensions`: comma-separated names of the extensions that can be installed or loaded. Nothing is allowed by default.
+- `preload_extensions`: names, a subset of the allowed ones, loaded when a database is opened.
+- `extension_directory`: where extensions are installed. Default: `duckdb_extensions` in the server data directory.
+
+The functions `duckdbVersion`, `duckdbExtensions`, `duckdbInstallExtension` and `duckdbLoadExtension` list, install and load extensions. They need the `WRITE` grant on the `FILE` source.
+Extensions linked into the DuckDB library (`json`, `parquet`, `icu`, `core_functions`, `autocomplete`) are always loaded. Other extensions can be installed, but not loaded, because ClickHouse does not allow dynamic library loading.
 
 ## Limitations {#limitations}
 
