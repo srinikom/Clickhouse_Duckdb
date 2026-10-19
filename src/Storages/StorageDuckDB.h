@@ -25,6 +25,14 @@ struct DuckDBExtensionInfo
     String description;
 };
 
+/// A function that an extension adds to DuckDB, e.g. `('parquet', 'read_parquet', 'table')`.
+struct DuckDBExtensionFunction
+{
+    String extension;
+    String name;
+    String type;
+};
+
 /// The functions below back the SQL functions `duckdbVersion`, `duckdbExtensions`, `duckdbInstallExtension` and
 /// `duckdbLoadExtension`. Extension management is off unless `duckdb.allow_extensions` is set in the server configuration,
 /// and only the names in `duckdb.allowed_extensions` can be installed or loaded.
@@ -32,6 +40,17 @@ String getDuckDBLibraryVersion();
 
 /// An empty `database_path` lists the extensions of a private in-memory database, i.e. what is installed in the extension directory.
 std::vector<DuckDBExtensionInfo> listDuckDBExtensions(const String & database_path, ContextPtr context);
+
+/// The functions of the loaded extensions, for `duckdbExtensionFunctions`: the built-in extensions have a known list, and for the
+/// others the functions that appeared when they were loaded.
+std::vector<DuckDBExtensionFunction> listDuckDBExtensionFunctions(const String & database_path, ContextPtr context);
+
+/// The table function `duckdb` runs any DuckDB query, which is allowed only by `duckdb.allow_arbitrary_sql`.
+void checkDuckDBArbitrarySQLAllowed(ContextPtr context);
+
+/// Resolves a database path against `user_files`. An empty path is an in-memory database if `allow_in_memory`, and an empty result.
+String resolveDuckDBDatabasePath(const String & path, ContextPtr context, bool allow_in_memory);
+
 void installDuckDBExtension(const String & name, ContextPtr context);
 void loadDuckDBExtension(const String & database_path, const String & name, ContextPtr context);
 
@@ -66,7 +85,9 @@ public:
         const ConstraintsDescription & constraints_,
         const String & comment,
         ContextPtr context_,
-        bool create_remote_table);
+        bool create_remote_table,
+        /// If not empty, the table is the result of this DuckDB query (the table function `duckdb`), and it is read-only.
+        const String & remote_query = {});
 
     ~StorageDuckDB() override;
 
@@ -90,8 +111,11 @@ private:
     /// temporarily unavailable does not fail the server start, and a read never silently creates a new file.
     std::shared_ptr<DuckDBInstance> getInstance(bool create_if_missing);
 
+    String getTableExpression() const;
+
     String database_path;
     String remote_table_name;
+    String remote_query;
 
     std::mutex instance_mutex;
     std::shared_ptr<DuckDBInstance> instance;

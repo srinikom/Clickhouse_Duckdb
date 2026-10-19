@@ -30,6 +30,6 @@ costs and is the way to go for an upstream-ready change.
 ## Extensions
 
 The `duckdb` section of the server configuration (`allow_extensions`, `allowed_extensions`, `preload_extensions`,
-`extension_directory`) and the functions `duckdbVersion`, `duckdbExtensions`, `duckdbInstallExtension`, `duckdbLoadExtension`
-manage DuckDB extensions, see the documentation of the engine. The tests are `05408_duckdb_functions` and `05409_duckdb_extensions`.
+`extension_directory`, `allow_arbitrary_sql`), the table function `duckdb` and the functions `duckdbVersion`, `duckdbExtensions`, `duckdbExtensionFunctions`, `duckdbInstallExtension`, `duckdbLoadExtension`
+manage DuckDB extensions, see the documentation of the engine. The tests are `05408_duckdb_functions`, `05409_duckdb_extensions` and `05410_duckdb_table_function`.
 Only the extensions linked into `libduckdb.so` can be loaded: the `clickhouse` binary does not allow `dlopen`.

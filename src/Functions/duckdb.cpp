@@ -132,6 +132,49 @@ private:
     ContextPtr context;
 };
 
+class FunctionDuckDBExtensionFunctions final : public FunctionDuckDBBase
+{
+public:
+    static constexpr auto name = "duckdbExtensionFunctions";
+
+    static FunctionPtr create(ContextPtr context)
+    {
+        checkDuckDBAccess(context);
+        return std::make_shared<FunctionDuckDBExtensionFunctions>(context);
+    }
+
+    explicit FunctionDuckDBExtensionFunctions(ContextPtr context_) : context(context_) {}
+
+    String getName() const override { return name; }
+    bool isVariadic() const override { return true; }
+    size_t getNumberOfArguments() const override { return 0; }
+
+    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
+    {
+        if (arguments.size() > 1)
+            throw Exception(
+                ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH, "Function {} takes at most 1 argument: the database path", getName());
+        checkStringArguments(arguments, getName());
+
+        return std::make_shared<DataTypeArray>(std::make_shared<DataTypeTuple>(
+            DataTypes{std::make_shared<DataTypeString>(), std::make_shared<DataTypeString>(), std::make_shared<DataTypeString>()},
+            Strings{"extension", "name", "type"}));
+    }
+
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override
+    {
+        const String database_path = arguments.empty() ? String{} : getConstantString(arguments, 0, getName());
+
+        Array rows;
+        for (const auto & function : listDuckDBExtensionFunctions(database_path, context))
+            rows.push_back(Tuple{function.extension, function.name, function.type});
+        return result_type->createColumnConst(input_rows_count, rows);
+    }
+
+private:
+    ContextPtr context;
+};
+
 class FunctionDuckDBInstallExtension final : public FunctionDuckDBBase
 {
 public:
@@ -200,6 +243,19 @@ private:
 
 REGISTER_FUNCTION(DuckDB)
 {
+    factory.registerFunction<FunctionDuckDBExtensionFunctions>(FunctionDocumentation{
+        .description = R"(
+Lists the functions that the loaded extensions of the embedded DuckDB provide, for example `read_parquet` of `parquet`. They can be used in the queries of the `duckdb` table function.
+For the extensions built into the DuckDB library the list is known in advance, for the others it is made of the functions that appeared when the extension was loaded.
+Requires `duckdb.allow_extensions` in the server configuration and the `WRITE` grant on the `FILE` source.
+)",
+        .syntax = "duckdbExtensionFunctions([database_path])",
+        .arguments = {{"database_path", "The path of a DuckDB database file inside `user_files`. Optional, the default is an in-memory database.", {"const String"}}},
+        .returned_value = {"The functions with their extensions.", {"Array(Tuple(extension String, name String, type String))"}},
+        .examples = {{"Usage", "SELECT arrayJoin(duckdbExtensionFunctions()) AS f WHERE f.name = 'read_parquet'", "('parquet','read_parquet','table')"}},
+        .introduced_in = {26, 11},
+        .category = FunctionDocumentation::Category::Introspection});
+
     factory.registerFunction<FunctionDuckDBVersion>(FunctionDocumentation{
         .description = "Returns the version of the embedded DuckDB library.",
         .syntax = "duckdbVersion()",

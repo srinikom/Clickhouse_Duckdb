@@ -1,0 +1,9 @@
+42	x
+b
+5	['b','c']
+('json','json_extract','scalar')
+('parquet','read_parquet','table')
+NOT_IMPLEMENTED
+DUCKDB_ENGINE_ERROR
+0
+SUPPORT_IS_DISABLED

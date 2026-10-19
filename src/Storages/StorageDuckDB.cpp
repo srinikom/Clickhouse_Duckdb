@@ -34,7 +34,9 @@
 #include <algorithm>
 #include <array>
 #include <filesystem>
+#include <map>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 
 namespace fs = std::filesystem;
@@ -56,6 +58,10 @@ namespace ErrorCodes
 struct DuckDBInstance
 {
     duckdb_database database = nullptr;
+
+    /// The functions that appeared when an extension was loaded into this database, by extension name.
+    std::mutex extension_functions_mutex;
+    std::map<String, std::set<std::pair<String, String>>> extension_functions;
 
     DuckDBInstance() = default;
     DuckDBInstance(const DuckDBInstance &) = delete;
@@ -280,10 +286,55 @@ private:
     duckdb_connection connection = nullptr;
 };
 
+/// Runs a query and returns its cells as text.
+std::vector<std::vector<String>> queryRows(duckdb_connection connection, const String & query)
+{
+    duckdb_result result;
+    if (duckdb_query(connection, query.c_str(), &result) != DuckDBSuccess)
+    {
+        String message = duckdb_result_error(&result) ? duckdb_result_error(&result) : "unknown error";
+        duckdb_destroy_result(&result);
+        throw Exception(ErrorCodes::DUCKDB_ENGINE_ERROR, "DuckDB: query '{}' failed: {}", query, message);
+    }
+
+    std::vector<std::vector<String>> rows;
+    for (idx_t row = 0; row < duckdb_row_count(&result); ++row)
+    {
+        auto & cells = rows.emplace_back();
+        for (idx_t column = 0; column < duckdb_column_count(&result); ++column)
+        {
+            char * value = duckdb_value_varchar(&result, column, row);
+            cells.emplace_back(value ? value : "");
+            duckdb_free(value);
+        }
+    }
+    duckdb_destroy_result(&result);
+    return rows;
+}
+
+/// The (name, type) pairs of the functions of a database, e.g. `('read_parquet', 'table')`.
+std::set<std::pair<String, String>> queryFunctions(duckdb_connection connection)
+{
+    std::set<std::pair<String, String>> functions;
+    for (const auto & row : queryRows(connection, "SELECT DISTINCT function_name, function_type FROM duckdb_functions()"))
+        functions.emplace(row[0], row[1]);
+    return functions;
+}
+
+/// DuckDB does not tell which extension a function belongs to, so the functions are registered by comparing
+/// the functions of the database before and after the extension is loaded.
 void loadExtension(const std::shared_ptr<DuckDBInstance> & instance, const String & name)
 {
     Connection connection(instance);
+    const auto before = queryFunctions(connection.get());
     connection.execute("LOAD " + name);
+    const auto after = queryFunctions(connection.get());
+
+    std::lock_guard lock(instance->extension_functions_mutex);
+    auto & registered = instance->extension_functions[name];
+    for (const auto & function : after)
+        if (!before.contains(function))
+            registered.insert(function);
 }
 
 std::shared_ptr<DuckDBInstance> openInstance(const String & path, bool create_if_missing, ContextPtr context)
@@ -406,19 +457,18 @@ String toDuckDBType(const DataTypePtr & type, const String & column_name)
         ErrorCodes::NOT_IMPLEMENTED, "The type {} of the column '{}' is not supported by the DuckDB table engine", type->getName(), column_name);
 }
 
-ColumnsDescription getTableStructure(Connection & connection, const String & table)
+/// `table_expression` is a quoted table name or a parenthesized query with an alias. The statement is only prepared, never executed:
+/// DuckDB refuses to prepare several statements, so a query of the `duckdb` table function cannot smuggle in a second one here.
+ColumnsDescription getTableStructure(Connection & connection, const String & table_expression)
 {
-    const String query = "SELECT * FROM " + quoteDuckDBIdentifier(table) + " LIMIT 0";
-    QueryResult query_result;
-    if (duckdb_query(connection.get(), query.c_str(), &query_result.result) != DuckDBSuccess)
-        throwDuckDBError("cannot describe the table '" + table + "'", duckdb_result_error(&query_result.result));
+    PreparedStatement statement(connection.get(), "SELECT * FROM " + table_expression);
 
     NamesAndTypesList columns;
-    const idx_t column_count = duckdb_column_count(&query_result.result);
+    const idx_t column_count = duckdb_prepared_statement_column_count(statement.get());
     for (idx_t i = 0; i < column_count; ++i)
     {
-        const String name = duckdb_column_name(&query_result.result, i);
-        auto logical_type = duckdb_column_logical_type(&query_result.result, i);
+        const String name = duckdb_prepared_statement_column_name(statement.get(), i);
+        auto logical_type = duckdb_prepared_statement_column_logical_type(statement.get(), i);
         const auto type_id = duckdb_get_type_id(logical_type);
         UInt8 width = 0;
         UInt8 scale = 0;
@@ -811,6 +861,72 @@ private:
 }
 
 
+void checkDuckDBArbitrarySQLAllowed(ContextPtr context)
+{
+    if (!context->getConfigRef().getBool("duckdb.allow_arbitrary_sql", false))
+        throw Exception(
+            ErrorCodes::SUPPORT_IS_DISABLED,
+            "Running DuckDB queries is disabled, set 'duckdb.allow_arbitrary_sql' in the server configuration");
+}
+
+String resolveDuckDBDatabasePath(const String & path, ContextPtr context, bool allow_in_memory)
+{
+    if (path.empty() && allow_in_memory)
+        return {};
+    return validateDatabasePath(path, context);
+}
+
+namespace
+{
+
+/// The functions that a built-in extension provides. DuckDB does not report this, and a built-in extension is loaded
+/// from the start, so there is no moment to compare the functions. A name is reported only if the database has it.
+const std::map<String, std::vector<String>> builtin_extension_functions
+{
+    {"parquet", {"read_parquet", "parquet_scan", "parquet_metadata", "parquet_schema", "parquet_file_metadata", "parquet_kv_metadata", "parquet_bloom_probe"}},
+    {"json", {"read_json", "read_json_auto", "read_json_objects", "read_json_objects_auto", "read_ndjson", "read_ndjson_auto", "read_ndjson_objects",
+              "json_extract", "json_extract_string", "json_exists", "json_valid", "json_type", "json_keys", "json_structure", "json_array_length",
+              "json_contains", "json_transform", "json_group_array", "json_group_object", "json_object", "json_array", "json_serialize_sql",
+              "json_deserialize_sql", "to_json", "from_json"}},
+    {"autocomplete", {"sql_auto_complete"}},
+    {"icu", {"icu_sort_key", "icu_calendar_names", "pg_timezone_names"}},
+};
+
+}
+
+std::vector<DuckDBExtensionFunction> listDuckDBExtensionFunctions(const String & database_path, ContextPtr context)
+{
+    const auto extensions = readExtensionSettings(context);
+    if (!extensions.enabled)
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "DuckDB extensions are disabled, set 'duckdb.allow_extensions' in the server configuration");
+
+    const String path = database_path.empty() ? String{} : validateDatabasePath(database_path, context);
+    auto instance = openInstance(path, /* create_if_missing */ false, context);
+    Connection connection(instance);
+
+    const auto functions = queryFunctions(connection.get());
+    std::set<std::tuple<String, String, String>> found;
+    for (const auto & row : queryRows(connection.get(), "SELECT extension_name FROM duckdb_extensions() WHERE loaded"))
+    {
+        const String & extension = row[0];
+
+        if (auto it = builtin_extension_functions.find(extension); it != builtin_extension_functions.end())
+            for (const auto & function : functions)
+                if (std::find(it->second.begin(), it->second.end(), function.first) != it->second.end())
+                    found.emplace(extension, function.first, function.second);
+
+        std::lock_guard lock(instance->extension_functions_mutex);
+        if (auto it = instance->extension_functions.find(extension); it != instance->extension_functions.end())
+            for (const auto & function : it->second)
+                found.emplace(extension, function.first, function.second);
+    }
+
+    std::vector<DuckDBExtensionFunction> res;
+    for (const auto & [extension, name, type] : found)
+        res.push_back({extension, name, type});
+    return res;
+}
+
 String getDuckDBLibraryVersion()
 {
     return duckdb_library_version();
@@ -876,18 +992,23 @@ StorageDuckDB::StorageDuckDB(
     const ConstraintsDescription & constraints_,
     const String & comment,
     ContextPtr context_,
-    bool create_remote_table)
+    bool create_remote_table,
+    const String & remote_query_)
     : StorageWithCommonVirtualColumns(table_id_)
     , WithContext(context_->getGlobalContext())
     , database_path(database_path_)
     , remote_table_name(remote_table_name_)
+    , remote_query(remote_query_)
 {
+    if (!remote_query.empty())
+        checkDuckDBArbitrarySQLAllowed(context_);
+
     StorageInMemoryMetadata storage_metadata;
 
     if (columns_.empty())
     {
         Connection connection(getInstance(/* create_if_missing */ false));
-        storage_metadata.setColumns(getTableStructure(connection, remote_table_name));
+        storage_metadata.setColumns(getTableStructure(connection, getTableExpression()));
     }
     else
     {
@@ -915,6 +1036,13 @@ StorageDuckDB::StorageDuckDB(
 }
 
 StorageDuckDB::~StorageDuckDB() = default;
+
+String StorageDuckDB::getTableExpression() const
+{
+    if (remote_query.empty())
+        return quoteDuckDBIdentifier(remote_table_name);
+    return "(" + remote_query + ") AS duckdb_query";
+}
 
 std::shared_ptr<DuckDBInstance> StorageDuckDB::getInstance(bool create_if_missing)
 {
@@ -945,7 +1073,7 @@ Pipe StorageDuckDB::read(
             plain_columns += ", ";
         plain_columns += quoteDuckDBIdentifier(name);
     }
-    const String table = quoteDuckDBIdentifier(remote_table_name);
+    const String table = getTableExpression();
 
     Block sample_block;
     for (const auto & name : column_names)
@@ -993,6 +1121,9 @@ Pipe StorageDuckDB::read(
 SinkToStoragePtr StorageDuckDB::write(
     const ASTPtr & /*query*/, const StorageMetadataPtr & metadata_snapshot, ContextPtr context_, bool /*async_insert*/)
 {
+    if (!remote_query.empty())
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Cannot INSERT into the 'duckdb' table function: it is the result of a query");
+
     return std::make_shared<DuckDBSink>(
         getInstance(/* create_if_missing */ false), metadata_snapshot, remote_table_name, getFormatSettings(context_));
 }
@@ -1097,6 +1228,7 @@ Extensions are managed by the `duckdb` section of the server configuration. They
     <allowed_extensions>json, parquet</allowed_extensions>
     <preload_extensions>json</preload_extensions>
     <extension_directory>/var/lib/clickhouse/duckdb_extensions/</extension_directory>
+    <allow_arbitrary_sql>1</allow_arbitrary_sql>
 </duckdb>
 ```
 
@@ -1104,15 +1236,17 @@ Extensions are managed by the `duckdb` section of the server configuration. They
 - `allowed_extensions`: comma-separated names of the extensions that can be installed or loaded. Nothing is allowed by default.
 - `preload_extensions`: names, a subset of the allowed ones, loaded when a database is opened.
 - `extension_directory`: where extensions are installed. Default: `duckdb_extensions` in the server data directory.
+- `allow_arbitrary_sql`: enables the `duckdb` table function, which runs a DuckDB query as is. Default `0`.
 
-The functions `duckdbVersion`, `duckdbExtensions`, `duckdbInstallExtension` and `duckdbLoadExtension` list, install and load extensions. They need the `WRITE` grant on the `FILE` source.
+The functions `duckdbVersion`, `duckdbExtensions`, `duckdbExtensionFunctions`, `duckdbInstallExtension` and `duckdbLoadExtension` list, install and load extensions. `duckdbExtensionFunctions` maps the loaded extensions to the functions they provide, e.g. `parquet` to `read_parquet`.
+The functions of an extension are used in the queries of the `duckdb` table function: `SELECT * FROM duckdb('', 'SELECT * FROM read_parquet(''data.parquet'')')`. The query can do everything DuckDB can, so it is off unless `allow_arbitrary_sql` is set, and it needs the `READ` grant on the `FILE` source. They need the `WRITE` grant on the `FILE` source.
 Extensions linked into the DuckDB library (`json`, `parquet`, `icu`, `core_functions`, `autocomplete`) are always loaded. Other extensions can be installed, but not loaded, because ClickHouse does not allow dynamic library loading.
 
 ## Limitations {#limitations}
 
 - `WHERE`, `LIMIT` and aggregations are not pushed down to DuckDB; the whole requested set of columns is read and filtered in ClickHouse.
 - `ALTER ... UPDATE`, `ALTER ... DELETE` and `TRUNCATE` are not supported. `DROP TABLE` drops only the ClickHouse table, not the DuckDB one.
-- There is no `duckdb` table function.
+- The `duckdb` table function is read-only and needs `duckdb.allow_arbitrary_sql`.
 )DOCS_MD",
         .syntax = "ENGINE = DuckDB('path_to_database_file', 'table')",
         .related = {"SQLite", "PostgreSQL"}});
