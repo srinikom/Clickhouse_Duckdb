@@ -218,6 +218,125 @@ DuckDB does not say which extension a function belongs to, so `duckdbExtensionFu
 
 An extension may add things that are not functions, such as file systems (`httpfs`) or settings, and then its list is empty.
 
+## Example: ingest into DuckDB and copy to MergeTree {#example-ingest-and-copy}
+
+This example uses the `DuckDB` engine as the write side (OLTP) and a native `MergeTree` table as the analytics side. Each insert into the DuckDB table is copied into the `MergeTree` table by a materialized view. The paths assume a server started as in [Manual testing](#manual-testing), with `/tmp/ch/user_files` as the `user_files` directory.
+
+### 1. Create the tables and the views {#example-create}
+
+```sql
+-- Start clean
+DROP TABLE IF EXISTS orders_to_mt;
+DROP TABLE IF EXISTS orders_daily_mv;
+DROP TABLE IF EXISTS orders_daily;
+DROP TABLE IF EXISTS orders_mt;
+DROP TABLE IF EXISTS orders_oltp;
+
+-- OLTP side: the table lives in the DuckDB file
+CREATE TABLE orders_oltp
+(
+    order_id Int64,
+    customer String,
+    amount Decimal(10, 2),
+    status String,
+    created_at DateTime64(3, 'UTC')
+)
+ENGINE = DuckDB('/tmp/ch/user_files/shop.duckdb', 'orders');
+
+-- Analytics side: native MergeTree
+CREATE TABLE orders_mt
+(
+    order_id Int64,
+    customer String,
+    amount Decimal(10, 2),
+    status String,
+    created_at DateTime64(3, 'UTC')
+)
+ENGINE = MergeTree ORDER BY (created_at, order_id);
+
+-- Copy what is already in DuckDB, then attach the live feed
+INSERT INTO orders_mt SELECT * FROM orders_oltp;
+CREATE MATERIALIZED VIEW orders_to_mt TO orders_mt AS SELECT * FROM orders_oltp;
+
+-- Optional: a daily rollup, fed from the MergeTree table
+CREATE TABLE orders_daily
+(
+    day Date,
+    orders AggregateFunction(count),
+    revenue AggregateFunction(sum, Decimal(10, 2))
+)
+ENGINE = AggregatingMergeTree ORDER BY day;
+
+CREATE MATERIALIZED VIEW orders_daily_mv TO orders_daily AS
+SELECT toDate(created_at) AS day, countState() AS orders, sumState(amount) AS revenue
+FROM orders_mt GROUP BY day;
+```
+
+Copy the rows that already exist before you create the view, as above. The view copies only the rows inserted after it exists, so creating it first and copying afterwards can insert the same rows twice.
+
+### 2. Ingest into DuckDB {#example-ingest}
+
+```sql
+INSERT INTO orders_oltp VALUES
+    (1, 'alice', 10.50, 'new',  '2026-10-01 10:00:00.000'),
+    (2, 'bob',   20.00, 'new',  '2026-10-01 11:30:00.000'),
+    (3, 'alice',  5.25, 'paid', '2026-10-02 09:15:00.000');
+INSERT INTO orders_oltp VALUES (4, 'carol', 99.99, 'new', '2026-10-02 12:00:00.000');
+```
+
+### 3. Check both sides {#example-check}
+
+```sql
+SELECT 'duckdb', count(), sum(amount) FROM orders_oltp;
+SELECT 'mergetree', count(), sum(amount) FROM orders_mt;
+
+SELECT day, countMerge(orders) AS orders, sumMerge(revenue) AS revenue
+FROM orders_daily GROUP BY day ORDER BY day;
+
+SELECT customer, count() AS orders, sum(amount) AS total
+FROM orders_mt GROUP BY customer ORDER BY total DESC;
+```
+
+The output:
+
+```text
+duckdb     4  135.74
+mergetree  4  135.74
+2026-10-01  2   30.5
+2026-10-02  2  105.24
+carol 1 99.99
+bob   1 20
+alice 2 15.75
+```
+
+Both tables hold the same rows. The DuckDB table stays the source of truth, and the analytics queries run on the `MergeTree` table.
+
+### 4. Catch up on missed rows {#example-catch-up}
+
+The view fires only on inserts made through ClickHouse. Rows that another process wrote into `shop.duckdb`, and rows inserted while the view did not exist, are not copied. This query copies the rows after the highest `order_id` that `orders_mt` already holds. It needs `duckdb.allow_arbitrary_sql`:
+
+```sql
+INSERT INTO orders_mt
+SELECT * FROM duckdb('/tmp/ch/user_files/shop.duckdb', 'SELECT * FROM orders')
+WHERE order_id > (SELECT max(order_id) FROM orders_mt);
+```
+
+It added no duplicates when nothing was missing. It was not tested against a real external writer, because the `duckdb` table function is read-only. Without `allow_arbitrary_sql`, use `INSERT INTO orders_mt SELECT * FROM orders_oltp WHERE order_id > ...`.
+
+### 5. Choose how to copy {#example-choose}
+
+| Approach | Copies | Use it for |
+| --- | --- | --- |
+| `INSERT INTO mt SELECT * FROM duckdb_table` | The rows now, once | Existing data. Add a `WHERE` on an id or a timestamp to copy in batches. |
+| `CREATE MATERIALIZED VIEW ... TO mt AS SELECT * FROM duckdb_table` | Each later insert made through ClickHouse | Live ingestion through ClickHouse. |
+| `CREATE MATERIALIZED VIEW ... REFRESH EVERY 1 MINUTE ENGINE = MergeTree ... AS SELECT * FROM duckdb_table` | The whole table on each refresh, including rows written outside ClickHouse | Small tables, or rows written by other processes. It needs `allow_experimental_refreshable_materialized_view = 1`. |
+
+### 6. Limits of this pattern {#example-limits}
+
+- The engine does not support `UPDATE` or `DELETE`, and the view copies only inserts. For status changes, insert a new row for each change and use `ReplacingMergeTree(updated_at)` for `orders_mt`.
+- If the insert into DuckDB succeeds but the copy into `orders_mt` fails, the row stays in DuckDB. Use the catch-up query to repair it.
+- `WHERE` outside the `duckdb` call is not pushed into DuckDB, so the catch-up query reads the whole table. For a big table, filter in the inner query, for example `'SELECT * FROM orders WHERE order_id > 1000000'`.
+
 ## Manual testing {#manual-testing}
 
 The commands below start from a built `clickhouse` binary and `libduckdb.so`. Replace the paths. All the SQL can be run in `clickhouse client`.
