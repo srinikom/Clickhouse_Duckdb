@@ -6,6 +6,8 @@
 
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
+#include <Columns/ColumnsNumber.h>
+#include <Core/UUID.h>
 #include <Core/Settings.h>
 #include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/DataTypeNullable.h>
@@ -16,6 +18,7 @@
 #include <Formats/FormatFactory.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromString.h>
+#include <IO/WriteBufferFromVector.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/convertFieldToType.h>
 #include <Interpreters/evaluateConstantExpression.h>
@@ -452,11 +455,64 @@ public:
     PreparedStatement & operator=(const PreparedStatement &) = delete;
 
     duckdb_prepared_statement get() const { return statement; }
-    const String & getQuery() const { return query; }
 
 private:
     String query;
     duckdb_prepared_statement statement = nullptr;
+};
+
+/// Appends rows with the DuckDB appender, which writes whole vectors instead of running a statement for each row.
+class Appender
+{
+public:
+    Appender(duckdb_connection connection, const String & table)
+    {
+        if (duckdb_appender_create(connection, nullptr, table.c_str(), &appender) != DuckDBSuccess)
+        {
+            const String message = errorMessage();
+            duckdb_appender_destroy(&appender);
+            throwDuckDBError("cannot append to the table '" + table + "'", message.c_str());
+        }
+    }
+
+    ~Appender()
+    {
+        /// Closing flushes the rows that are left, which is harmless when the transaction is rolled back afterwards.
+        duckdb_appender_destroy(&appender);
+    }
+
+    Appender(const Appender &) = delete;
+    Appender & operator=(const Appender &) = delete;
+
+    void check(duckdb_state state) const
+    {
+        if (state != DuckDBSuccess)
+            throwDuckDBError("cannot append the rows", errorMessage().c_str());
+    }
+
+    duckdb_appender get() const { return appender; }
+
+    /// The columns are appended in the order they are added, and the others get their default value.
+    void addColumn(const String & name) const { check(duckdb_appender_add_column(appender, name.c_str())); }
+
+    void endRow() const { check(duckdb_appender_end_row(appender)); }
+
+    /// Writes the rows to the table. Constraint violations are reported here.
+    void close()
+    {
+        check(duckdb_appender_close(appender));
+    }
+
+private:
+    String errorMessage() const
+    {
+        auto data = duckdb_appender_error_data(appender);
+        String message = duckdb_error_data_message(data) ? duckdb_error_data_message(data) : "unknown error";
+        duckdb_destroy_error_data(&data);
+        return message;
+    }
+
+    duckdb_appender appender = nullptr;
 };
 
 class QueryResult
@@ -822,34 +878,46 @@ public:
         , connection(std::move(instance))
         , format_settings(std::move(format_settings_))
     {
-        String columns_list;
-        String placeholders;
         for (const auto & column : getHeader())
         {
             const auto nested = removeNullable(column.type);
             const WhichDataType which(nested);
-            if (!(isBool(nested) || which.isNativeInt() || which.isNativeUInt() || which.isFloat() || which.isString() || isTextBindable(nested)))
+
+            ColumnWriter writer;
+            writer.name = column.name;
+            writer.nullable = column.type->isNullable();
+            if (isBool(nested))
+                writer.kind = Kind::Bool;
+            else if (which.isNativeUInt())
+                writer.kind = Kind::UInt;
+            else if (which.isNativeInt())
+                writer.kind = Kind::Int;
+            else if (which.isFloat())
+                writer.kind = Kind::Float;
+            else if (which.isString())
+                writer.kind = Kind::String;
+            else if (which.isUUID())
+                writer.kind = Kind::UUID;
+            else if (isTextBindable(nested))
+                writer.kind = Kind::Text;
+            else
                 throw Exception(
                     ErrorCodes::NOT_IMPLEMENTED,
                     "Cannot insert the column '{}' of type {} into a DuckDB table", column.name, column.type->getName());
 
-            if (!columns_list.empty())
-            {
-                columns_list += ", ";
-                placeholders += ", ";
-            }
-            columns_list += quoteDuckDBIdentifier(column.name);
-            placeholders += "?";
-            serializations.push_back(nested->getDefaultSerialization());
+            writer.serialization = nested->getDefaultSerialization();
+            writers.push_back(std::move(writer));
         }
 
-        statement = std::make_unique<PreparedStatement>(
-            connection.get(), "INSERT INTO " + quoteDuckDBIdentifier(table) + " (" + columns_list + ") VALUES (" + placeholders + ")");
+        appender = std::make_unique<Appender>(connection.get(), table);
+        for (const auto & writer : writers)
+            appender->addColumn(writer.name);
     }
 
     ~DuckDBSink() override
     {
-        /// Rolls back what was written if the insert did not finish.
+        /// Rolls back what was written if the insert did not finish. The appender is closed first, it uses the transaction.
+        appender.reset();
         if (transaction_open)
         {
             duckdb_result result;
@@ -869,18 +937,28 @@ protected:
             transaction_open = true;
         }
 
-        const auto & header = getHeader();
         const auto columns = chunk.getColumns();
         const size_t rows = chunk.getNumRows();
 
+        /// Resolve the nested column and the null map once for the chunk, not for every value.
+        std::vector<const IColumn *> values(columns.size());
+        std::vector<const UInt8 *> null_maps(columns.size(), nullptr);
+        for (size_t col = 0; col < columns.size(); ++col)
+        {
+            values[col] = columns[col].get();
+            if (const auto * nullable = typeid_cast<const ColumnNullable *>(columns[col].get()))
+            {
+                values[col] = &nullable->getNestedColumn();
+                null_maps[col] = nullable->getNullMapData().data();
+            }
+        }
+
+        const duckdb_appender handle = appender->get();
         for (size_t row = 0; row < rows; ++row)
         {
             for (size_t col = 0; col < columns.size(); ++col)
-                bindValue(col, header.getByPosition(col), *columns[col], row);
-
-            QueryResult result;
-            if (duckdb_execute_prepared(statement->get(), &result.result) != DuckDBSuccess)
-                throwDuckDBError("cannot execute '" + statement->getQuery() + "'", duckdb_result_error(&result.result));
+                appender->check(appendValue(handle, writers[col], *values[col], null_maps[col] && null_maps[col][row], row));
+            appender->endRow();
         }
     }
 
@@ -888,59 +966,76 @@ protected:
     {
         if (!transaction_open)
             return;
+        appender->close();
         connection.execute("COMMIT");
         transaction_open = false;
     }
 
 private:
-    void bindValue(size_t col, const ColumnWithTypeAndName & header_column, const IColumn & column, size_t row)
+    enum class Kind : UInt8
     {
-        const idx_t index = col + 1;
-        duckdb_state state = DuckDBSuccess;
+        Bool,
+        UInt,
+        Int,
+        Float,
+        String,
+        UUID, /// Appended as a value, because the cast from text is ten times slower.
+        Text,
+    };
 
-        if (header_column.type->isNullable() && column.isNullAt(row))
-        {
-            state = duckdb_bind_null(statement->get(), index);
-        }
-        else
-        {
-            const auto nested = removeNullable(header_column.type);
-            const WhichDataType which(nested);
-            const IColumn * value_column = &column;
-            if (const auto * nullable = typeid_cast<const ColumnNullable *>(&column))
-                value_column = &nullable->getNestedColumn();
+    struct ColumnWriter
+    {
+        String name;
+        Kind kind = Kind::Int;
+        bool nullable = false;
+        SerializationPtr serialization;
+    };
 
-            if (isBool(nested))
-                state = duckdb_bind_boolean(statement->get(), index, value_column->getUInt(row) != 0);
-            else if (which.isNativeUInt())
-                state = duckdb_bind_uint64(statement->get(), index, value_column->getUInt(row));
-            else if (which.isNativeInt())
-                state = duckdb_bind_int64(statement->get(), index, value_column->getInt(row));
-            else if (which.isFloat())
-                state = duckdb_bind_double(statement->get(), index, value_column->getFloat64(row));
-            else if (which.isString())
+    duckdb_state appendValue(duckdb_appender handle, const ColumnWriter & writer, const IColumn & column, bool is_null, size_t row)
+    {
+        if (is_null)
+            return duckdb_append_null(handle);
+
+        switch (writer.kind)
+        {
+            case Kind::Bool:
+                return duckdb_append_bool(handle, column.getUInt(row) != 0);
+            case Kind::UInt:
+                return duckdb_append_uint64(handle, column.getUInt(row));
+            case Kind::Int:
+                return duckdb_append_int64(handle, column.getInt(row));
+            case Kind::Float:
+                return duckdb_append_double(handle, column.getFloat64(row));
+            case Kind::String:
             {
-                const auto data = value_column->getDataAt(row);
-                state = duckdb_bind_varchar_length(statement->get(), index, data.data(), data.size());
+                const auto data = column.getDataAt(row);
+                return duckdb_append_varchar_length(handle, data.data(), data.size());
             }
-            else
+            case Kind::UUID:
+            {
+                const auto & uuid = assert_cast<const ColumnUUID &>(column).getData()[row];
+                duckdb_value value = duckdb_create_uuid({UUIDHelpers::getLowBytes(uuid), UUIDHelpers::getHighBytes(uuid)});
+                const duckdb_state state = duckdb_append_value(handle, value);
+                duckdb_destroy_value(&value);
+                return state;
+            }
+            case Kind::Text:
             {
                 /// DuckDB casts the text to the type of the column it is inserted into.
-                WriteBufferFromOwnString buf;
-                serializations[col]->serializeText(*value_column, row, buf, format_settings);
-                const String text = buf.str();
-                state = duckdb_bind_varchar_length(statement->get(), index, text.data(), text.size());
+                text.clear();
+                WriteBufferFromVector<String> buf(text);
+                writer.serialization->serializeText(column, row, buf, format_settings);
+                buf.finalize();
+                return duckdb_append_varchar_length(handle, text.data(), text.size());
             }
         }
-
-        if (state != DuckDBSuccess)
-            throwDuckDBError("cannot bind the column '" + header_column.name + "'", duckdb_prepare_error(statement->get()));
     }
 
     Connection connection;
     FormatSettings format_settings;
-    std::unique_ptr<PreparedStatement> statement;
-    std::vector<SerializationPtr> serializations;
+    std::unique_ptr<Appender> appender;
+    std::vector<ColumnWriter> writers;
+    String text; /// Reused for the values that are written as text.
     bool transaction_open = false;
 };
 

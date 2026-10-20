@@ -505,6 +505,17 @@ The `duckdb` table function wraps its argument into a subquery, so it runs the D
 
 `PIVOT` without an `IN` list is rejected, because DuckDB expands it into several statements.
 
+## Insert performance {#insert-performance}
+
+`INSERT` into a `DuckDB` table writes the rows with the DuckDB appender in one transaction. Measured on 1,000,000 rows with one insert thread, in the Linux builder container with 4 CPUs:
+
+| Table | Rows per second |
+| --- | --- |
+| 2 integer columns | about 2,700,000 |
+| 9 mixed columns (`Int64`, `String`, `Float64`, `Date`, `DateTime64(6)`, `UUID`, `Decimal`, `Nullable(Int32)`, `Bool`) | about 480,000 |
+
+Earlier versions ran one `INSERT` statement for each row, which was about 1,000 to 1,400 rows per second. Larger inserts are faster than many small ones, because each insert is a transaction: insert in batches and avoid one-row inserts. `Date`, `DateTime64` and `Decimal` values are cast by DuckDB from text, which costs more than the numeric and string columns.
+
 ## Limitations {#limitations}
 
 - Linux only, and `libduckdb.so` is a run-time dependency.
