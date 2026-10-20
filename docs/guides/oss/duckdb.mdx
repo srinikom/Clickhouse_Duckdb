@@ -495,6 +495,16 @@ python3 tests/clickhouse-test --binary ./clickhouse --queries tests/queries --no
 | `Cannot access directory ... file system operations are disabled` | The database was opened with `allow_extensions` off, which disables the file system for DuckDB. |
 | `Could not set lock on file` | Another process, such as the `duckdb` command line, holds the database file. |
 
+## DuckDB statements {#duckdb-statements}
+
+The `duckdb` table function wraps its argument into a subquery, so it runs the DuckDB statements that DuckDB accepts as a subquery. Every other statement of the [DuckDB statement list](https://duckdb.org/docs/current/sql/statements/overview) is rejected by DuckDB with `DUCKDB_ENGINE_ERROR` before it runs and changes nothing. The test `05412_duckdb_statements` runs every statement of the list.
+
+| Works through `duckdb` | Use the ClickHouse statement of the `DuckDB` engine instead | Not available |
+| --- | --- | --- |
+| `SELECT`, `FROM`-first `SELECT`, `DESCRIBE`, `SHOW`, `SHOW DATABASES`, `SHOW TABLES`, `SUMMARIZE`, `UNPIVOT`, `PIVOT` with an `IN` list | `CREATE TABLE`, `INSERT`, `SELECT`, `DROP TABLE` (ClickHouse table only), transactions | `UPDATE`, `DELETE`, `MERGE INTO`, `ALTER TABLE`, `ALTER VIEW`, `ATTACH`, `DETACH`, `CALL`, `CHECKPOINT`, `COMMENT ON`, `COPY`, `CREATE INDEX`, `CREATE MACRO`, `CREATE SCHEMA`, `CREATE SECRET`, `CREATE SEQUENCE`, `CREATE TYPE`, `CREATE VIEW`, `EXPORT DATABASE`, `IMPORT DATABASE`, `PREPARE`, `EXECUTE`, `DEALLOCATE`, `PRAGMA`, `SET`, `RESET`, `SET VARIABLE`, `USE`, `VACUUM`, `ANALYZE`, `EXPLAIN`, `BEGIN`, `COMMIT`; `LOAD` and `INSTALL` are available as `duckdbLoadExtension` and `duckdbInstallExtension` |
+
+`PIVOT` without an `IN` list is rejected, because DuckDB expands it into several statements.
+
 ## Limitations {#limitations}
 
 - Linux only, and `libduckdb.so` is a run-time dependency.
