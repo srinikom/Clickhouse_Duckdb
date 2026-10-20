@@ -633,6 +633,18 @@ The `duckdb` table function wraps its argument into a subquery, so it runs the D
 | 2 integer columns | about 2,700,000 |
 | 9 mixed columns (`Int64`, `String`, `Float64`, `Date`, `DateTime64(6)`, `UUID`, `Decimal`, `Nullable(Int32)`, `Bool`) | about 480,000 |
 
+The size of an insert matters more than any DuckDB setting. Each insert is one DuckDB transaction with a fixed commit cost, so the rate depends on the rows per insert. Measured through the server, with sequential inserts of `numbers(N)` in the same container:
+
+| Rows per insert | Inserts per second | Rows per second |
+| --- | --- | --- |
+| 1 | 63 | 63 |
+| 100 | 64 | 6,400 |
+| 10,000 | 34 | 339,000 |
+
+A one-row insert into a `MergeTree` table took 72 ms in the same run, against 15 ms for the `DuckDB` table, and 10 ms for a `Null` table, which shows the cost of the query itself. The commit cost depends on the file system: in a direct test of the DuckDB library, a one-row transaction took 4 ms on the container's overlay file system and 1.5 ms on tmpfs.
+
+The DuckDB tuning settings `threads`, `ROW_GROUP_SIZE`, `preserve_insertion_order` and `COMPRESS` did not change the insert rate in tests with the DuckDB library (3 to 10 million rows). `threads` made scans of the table faster, from 0.65 s with one thread to 0.13 s with four, and the default already uses all the cores.
+
 Earlier versions ran one `INSERT` statement for each row, which was about 1,000 to 1,400 rows per second. Larger inserts are faster than many small ones, because each insert is a transaction: insert in batches and avoid one-row inserts. `Date`, `DateTime64` and `Decimal` values are cast by DuckDB from text, which costs more than the numeric and string columns.
 
 ## Limitations {#limitations}
