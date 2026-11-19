@@ -181,14 +181,27 @@ Each `INSERT` is one DuckDB transaction: its rows stay invisible until it commit
 
 ## Performance
 
-Measured in a Linux container with 4 CPUs, one insert thread, 1,000,000 rows:
+Measured on 2026-11-19 in a Linux container on the machine below, with one insert thread and 1,000,000 rows.
+
+| Part | Specification |
+| --- | --- |
+| Machine | Intel Core i5-7600 at 3.5 GHz, 4 cores (4 threads), 40 GB of RAM, macOS 13.7.8 |
+| Linux VM | Colima 0.10.3 with the Docker 29.5.2 runtime, `x86_64`, 4 CPUs, 8 GB of RAM, Linux 6.8 |
+| Software | ClickHouse 26.11, DuckDB v1.5.6 |
+| Disk | The DuckDB file is on the container's file system inside the VM. A synchronous 4 KiB write there takes about 1.8 ms, and the rate of small inserts depends on it (see [Small inserts depend on the disk](#small-inserts-depend-on-the-disk)). |
 
 | Table | Rows per second |
 | --- | --- |
-| 2 integer columns | about 2,700,000 |
-| 9 mixed columns (`Int64`, `String`, `Float64`, `Date`, `DateTime64(6)`, `UUID`, `Decimal`, `Nullable(Int32)`, `Bool`) | about 480,000 |
+| 2 integer columns | about 3,100,000 |
+| 9 mixed columns (`Int64`, `String`, `Float64`, `Date`, `DateTime64(6)`, `UUID`, `Decimal`, `Nullable(Int32)`, `Bool`) | about 500,000 |
 
-Inserts use the DuckDB appender. Insert in batches, because every insert is a transaction with a fixed commit cost: about 63 rows per second at one row per insert, 6,400 at 100 rows, and 339,000 at 10,000 rows. The DuckDB settings `threads`, `ROW_GROUP_SIZE`, `preserve_insertion_order` and `COMPRESS` did not change the insert rate.
+Inserts use the DuckDB appender. Insert in batches, because every insert is a transaction with a fixed commit cost: about 66 rows per second at one row per insert, 6,300 at 100 rows, and 361,000 at 10,000 rows. The DuckDB settings `threads`, `ROW_GROUP_SIZE`, `preserve_insertion_order` and `COMPRESS` did not change the insert rate.
+
+### Small inserts depend on the disk
+
+A transaction ends with a synchronous disk write, so the fixed cost of an insert is mostly the time the disk needs to complete that write. A one-row insert is limited by the disk, and a large batch is limited by the CPU.
+
+For many small transactions, use storage with a low sync latency and batch the inserts where you can.
 
 ## Supported statements
 
