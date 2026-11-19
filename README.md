@@ -18,6 +18,48 @@ ClickHouse® is a registered trademark of ClickHouse, Inc. This project is not a
 
 DuckDB is reached through its C API and the prebuilt `libduckdb.so`, which is a run-time dependency of the `clickhouse` binary.
 
+## Architecture
+
+```text
+  clients: clickhouse-client, HTTP, drivers
+        |
+        |  SQL (port 9000 native, 8123 HTTP)
+        v
++-- one Linux host or container -----------------------------------------------+
+|                                                                              |
+|  clickhouse server (built with -DENABLE_DUCKDB=1)                            |
+|  +------------------------------------------------------------------------+  |
+|  |                                                                        |  |
+|  |   DuckDB table engine ---> materialized view ---> MergeTree            |  |
+|  |   (OLTP: INSERT, SELECT)   (copies each INSERT)   (analytics)          |  |
+|  |   |                        (through ClickHouse only)                   |  |
+|  |   |                                                                    |  |
+|  |   +<--- duckdb table function (read-only) and extension functions      |  |
+|  |   |                                                                    |  |
+|  |   v  C API                                                             |  |
+|  |   +--------------------------+                                         |  |
+|  |   | libduckdb.so (v1.5.6)    |                                         |  |
+|  |   | in-process, found via    |                                         |  |
+|  |   | LD_LIBRARY_PATH          |                                         |  |
+|  |   +--------------------------+                                         |  |
+|  +------------------------------------------------------------------------+  |
+|                                                                              |
+|  On disk:                                                                    |
+|   user_files/app.duckdb (+ .wal)   DuckDB tables; one process can open it    |
+|   user_files/*.parquet             files for read_parquet                    |
+|   duckdb_extensions/               installed extensions                      |
+|   data/                            MergeTree parts                           |
+|   config.d/duckdb.xml              duckdb section, the security gates        |
++------------------------------------------------------------------------------+
+        |
+        v  optional, only if the config allows it
+  DuckDB extension repository (internet)
+```
+
+- One process holds the DuckDB file, so the `duckdb` command line cannot open `app.duckdb` while the server runs.
+- `libduckdb.so` runs inside the server process. There is no separate DuckDB service.
+- The materialized view copies only inserts made through ClickHouse, not rows that other tools write to the DuckDB file.
+
 ## Quick start
 
 ### Build
