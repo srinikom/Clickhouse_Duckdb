@@ -6,7 +6,7 @@ title: 'Embedded DuckDB'
 doc_type: 'guide'
 ---
 
-ClickHouse can use [DuckDB](https://duckdb.org) as an embedded database for OLTP-style tables: small tables with transactional inserts, stored in a single DuckDB file next to the server. This page describes how to build and configure the integration, how to use it, and how to test it by hand.
+ClickHouse can use [DuckDB](https://duckdb.org) as an embedded database for OLTP-style tables: tables with transactional inserts, stored in a single DuckDB file next to the server. This page describes how to build and configure the integration, how to use it, and how to test it by hand.
 
 <Note>
 The integration is Linux only and is disabled in a default build. It talks to DuckDB through the DuckDB C API and links the prebuilt `libduckdb.so`, so the library is a run-time dependency of the `clickhouse` binary.
