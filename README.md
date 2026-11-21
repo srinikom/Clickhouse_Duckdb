@@ -188,7 +188,7 @@ Measured on 2026-11-19 in a Linux container on the machine below, with one inser
 | Machine | Intel Core i5-7600 at 3.5 GHz, 4 cores (4 threads), 40 GB of RAM, macOS 13.7.8 |
 | Linux VM | Colima 0.10.3 with the Docker 29.5.2 runtime, `x86_64`, 4 CPUs, 8 GB of RAM, Linux 6.8 |
 | Software | ClickHouse 26.11, DuckDB v1.5.6 |
-| Disk | The DuckDB file is on the container's file system inside the VM. A synchronous 4 KiB write there takes about 1.8 ms, and the rate of small inserts depends on it (see [Small inserts depend on the disk](#small-inserts-depend-on-the-disk)). |
+| Disk | The DuckDB file is on the container's file system inside the VM. A synchronous 4 KiB write there takes about 1.8 ms, and the rate of small inserts depends on it (see [Small inserts](#small-inserts)). |
 
 | Table | Rows per second |
 | --- | --- |
@@ -197,11 +197,60 @@ Measured on 2026-11-19 in a Linux container on the machine below, with one inser
 
 Inserts use the DuckDB appender. Insert in batches, because every insert is a transaction with a fixed commit cost: about 66 rows per second at one row per insert, 6,300 at 100 rows, and 361,000 at 10,000 rows. The DuckDB settings `threads`, `ROW_GROUP_SIZE`, `preserve_insertion_order` and `COMPRESS` did not change the insert rate.
 
-### Small inserts depend on the disk
+### Small inserts
 
-A transaction ends with a synchronous disk write, so the fixed cost of an insert is mostly the time the disk needs to complete that write. A one-row insert is limited by the disk, and a large batch is limited by the CPU.
+Measured on 2026-11-21 on the same machine, a one-row insert took about 14 ms on a server without the full `config.xml`. The time splits into three parts:
 
-For many small transactions, use storage with a low sync latency and batch the inserts where you can.
+| Part | Time per insert |
+| --- | --- |
+| ClickHouse's own work for the query, measured with a `Null` table | 7.6 ms |
+| DuckDB's commit: one `fsync` of its write-ahead log | about 2 ms |
+| DuckDB's statements and the engine's setup for each `INSERT` | about 5 ms |
+
+ClickHouse's own work is the same with any table engine. Because of it, an insert of 100 rows took about as long as an insert of one row. Batching is the main remedy.
+
+The sync depends on the disk. On a disk with slow syncs it becomes the larger part, so use storage with a low sync latency for many small transactions.
+
+DuckDB has no setting that skips or delays the sync at commit. `checkpoint_threshold` (also called `wal_autocheckpoint`) and `immediate_transaction_mode` did not change the one-row rate. A very small `checkpoint_threshold` made it slower.
+
+The server's full `config.xml`, with its system log tables and a trace-level log file, added about 2 ms to every query: 9.4 ms instead of 7.6 ms.
+
+### Comparison with the `SQLite` and `PostgreSQL` engines
+
+Measured on 2026-11-21 on the machine above, with 1,000,000 rows. Each figure is the median of three alternating rounds.
+
+This build does not include the `SQLite` and `PostgreSQL` engines, so they ran in the official ClickHouse 26.12 build. PostgreSQL 17.11 ran with default settings in a container on the same VM, reached over local TCP. The SQLite file used default settings, with a rollback journal.
+
+| Rows per second | `DuckDB` | `SQLite` | `PostgreSQL` |
+| --- | --- | --- | --- |
+| Insert, 2 integer columns | **2,800,000** | 1,570,000 | 1,320,000 |
+| Insert, 9 mixed columns | **489,000** | 312,000 | 234,000 |
+| Engine's own time for the 9-column insert | **1.77 s** | 3.03 s | 4.11 s |
+| 1 row per insert | 61 | 56 | **94** |
+| 100 rows per insert | 6,320 | 6,010 | **9,350** |
+| 10,000 rows per insert | 381,000 | 328,000 | 399,000 |
+| Scan, 2 integer columns | 2,270,000 | **3,460,000** | 2,420,000 |
+| Scan, 9 columns with `count`, `sum` and `length` | **2,870,000** | 2,510,000 | 1,170,000 |
+| Scan, all 9 columns | **906,000** | 791,000 | 614,000 |
+
+The engine's own time is the 9-column insert minus an insert of the same rows into a `Null` table. The official build does ClickHouse's own bulk work faster: 5.9 million rows per second into `Null`, against 3.8 million for this build. The insert rows therefore understate the `DuckDB` engine. The engine's own time removes that difference.
+
+The `DuckDB` figures come from a server with the full `config.xml`. Without it, as for the other two, the one-row rate was 70.
+
+For a one-row insert, the time each engine adds to ClickHouse's own work is shown below. Both servers ran without `config.xml`, and the disk calls were counted with `strace`.
+
+| Per one-row insert | `DuckDB` | `SQLite` | `PostgreSQL` |
+| --- | --- | --- | --- |
+| Total | 14.3 ms | 17.7 ms | 10.6 ms |
+| ClickHouse's own work (`Null` table) | 7.6 ms | 7.8 ms | 7.8 ms |
+| Engine and database | 6.7 ms | 9.9 ms | 2.8 ms |
+| Disk calls | 1 `fsync` of a growing log file | 4 `fsync`, plus creating and deleting a journal file | 1 write and 1 `fdatasync` in the PostgreSQL server |
+
+- **`PostgreSQL`** has the cheapest commit, even though it runs as a separate server. It syncs its log with `fdatasync` into files that already have their full size, which took 0.7 to 0.9 ms here, and the engine reuses pooled connections.
+- **`SQLite`** syncs four times per commit with its default rollback journal.
+- **`DuckDB`** syncs once, but with `fsync` on a log file that grows. That also writes the file system's metadata and took 1.8 to 2.2 ms here. The rest of its time is DuckDB's statement work and the engine's setup for each `INSERT`.
+- **Scans:** no engine pushes aggregation down, so every row is copied into ClickHouse. PostgreSQL computed the same aggregates by itself about 5 times faster, using parallel workers.
+- **Without ClickHouse:** PostgreSQL alone, through `psql`, did 625 one-row inserts per second.
 
 ## Supported statements
 
